@@ -548,7 +548,7 @@ def nearest_aspect(w, h):
 
 def generate_part(job, i, total, video_url, image_urls, prompt, resolution, seconds, aspect):
     body = {"prompt": prompt, "reference_videos": [video_url], "reference_images": image_urls[:9],
-            "resolution": resolution, "duration": max(4, min(15, round(seconds, 1))), "aspect_ratio": aspect}
+            "resolution": resolution, "duration": int(max(4, min(15, round(seconds)))), "aspect_ratio": aspect}
     if AUTH["tokens"]:
         return oauth_generate(job, i, total, body)
     return api_generate(job, i, total, body)
@@ -600,9 +600,11 @@ def worker(jid, base, opts):
             fixed = []
             for k, (_, out) in enumerate(outs, 1):          # same size/fps so the parts join cleanly
                 fx = os.path.join(wd, f"fix_{k}.mp4")
+                want, got = duration(_), duration(out)       # Krea only makes whole seconds: stretch to match
+                ratio = want / got if got > 0 else 1.0
                 run(["ffmpeg", "-y", "-loglevel", "error", "-i", out, "-an", "-vf",
-                     f"scale={w}:{h},fps=30,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast",
-                     "-crf", "19", fx])
+                     f"setpts={ratio:.5f}*PTS,scale={w}:{h},fps=30,format=yuv420p", "-t", f"{want:.3f}",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", fx])
                 fixed.append(fx)
             lst = os.path.join(wd, "list.txt")
             with open(lst, "w") as fh:
@@ -713,7 +715,7 @@ def status(jid):
 
 @app.get("/files/<jid>/<name>")
 def files(jid, name):          # Krea downloads the clip + reference images from here
-    if jid not in JOBS or not re.fullmatch(r"(chunk_\d+\.mp4|ref_\d+\.jpg)", name):
+    if not re.fullmatch(r"[0-9a-f]{12}", jid) or not re.fullmatch(r"(chunk_\d+\.mp4|ref_\d+\.jpg)", name):
         abort(404)
     p = os.path.join(JOB_DIR, jid, name)
     if not os.path.exists(p):
