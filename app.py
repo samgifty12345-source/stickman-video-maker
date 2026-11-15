@@ -21,6 +21,10 @@ Environment variables:
   MAX_VIDEO_SECONDS longest upload allowed, default 120
   SEEDANCE_ENDPOINT / SEEDANCE_MODEL  override the API path / MCP model id if Krea changes them
   SEEDANCE_TOOL     optional. Force the exact Krea MCP tool name used to make the video (e.g. generate_video).
+  LIBRARY_DIR       optional. Where finished videos are kept. On Railway add a Volume mounted at /data and they
+                    survive redeploys (default: /data/library if /data exists, else a temp folder).
+  ZERNIO_API_KEY    optional. Your Zernio API key, used to post finished videos to YouTube Shorts.
+  ZERNIO_ACCOUNT_ID optional. Which connected YouTube channel to post to (default: the first one in Zernio).
   PORT              set by Railway
 """
 import base64
@@ -58,6 +62,21 @@ CHUNK = max(5, min(15, int(os.environ.get("CHUNK_SECONDS", "15"))))   # Seedance
 MAX_VIDEO = int(os.environ.get("MAX_VIDEO_SECONDS", "120"))
 JOB_DIR = os.path.join(tempfile.gettempdir(), "remix_jobs")
 os.makedirs(JOB_DIR, exist_ok=True)
+ZERNIO_KEY = os.environ.get("ZERNIO_API_KEY", "").strip()
+ZERNIO_ACCOUNT = os.environ.get("ZERNIO_ACCOUNT_ID", "").strip()
+ZERNIO = "https://zernio.com/api/v1"
+
+
+def _pick_library_dir():
+    d = os.environ.get("LIBRARY_DIR", "").strip()
+    if not d:
+        d = "/data/library" if os.path.isdir("/data") and os.access("/data", os.W_OK) else \
+            os.path.join(tempfile.gettempdir(), "remix_library")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+LIB_DIR = _pick_library_dir()
 
 LOGS = deque(maxlen=1500)
 LOG_LOCK = threading.Lock()
@@ -586,6 +605,67 @@ def download(url, dst):
         shutil.copyfileobj(r, f)
 
 
+# ------------------------------------------------------------------ saved videos + YouTube (Zernio)
+def lib_save(meta):
+    with open(os.path.join(LIB_DIR, meta["id"] + ".json"), "w") as fh:
+        json.dump(meta, fh)
+
+
+def lib_load(vid):
+    if not re.fullmatch(r"[0-9a-f]{12}", vid or ""):
+        return None
+    try:
+        with open(os.path.join(LIB_DIR, vid + ".json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def lib_list():
+    items = []
+    for f in os.listdir(LIB_DIR):
+        if f.endswith(".json"):
+            m = lib_load(f[:-5])
+            if m and os.path.exists(os.path.join(LIB_DIR, m["id"] + ".mp4")):
+                items.append(m)
+    return sorted(items, key=lambda m: m.get("created", 0), reverse=True)
+
+
+def parse_tags(text):
+    tags = [t.strip().lstrip("#") for t in re.split(r"[,\n]", text or "")]
+    return [t for t in tags if t][:30]
+
+
+def zernio_account():
+    if ZERNIO_ACCOUNT:
+        return ZERNIO_ACCOUNT
+    r = http_json(ZERNIO + "/accounts?platform=youtube", headers={"Authorization": "Bearer " + ZERNIO_KEY})
+    accs = r.get("accounts") or []
+    if not accs:
+        raise RuntimeError("No YouTube channel is connected in your Zernio account. Connect one in the Zernio dashboard.")
+    a = accs[0]
+    acc = a.get("_id") or a.get("id") or a.get("accountId")
+    if not acc:
+        raise RuntimeError(f"Could not read the YouTube account id from Zernio: {str(a)[:200]}")
+    return acc
+
+
+def zernio_post(video_url, title, description, tags, visibility):
+    """Publish one video to YouTube through Zernio. Returns the YouTube link (or a status word)."""
+    if not ZERNIO_KEY:
+        raise RuntimeError("ZERNIO_API_KEY is not set on Railway.")
+    body = {"content": description or "", "tags": tags,
+            "mediaItems": [{"type": "video", "url": video_url}],
+            "platforms": [{"platform": "youtube", "accountId": zernio_account(),
+                           "platformSpecificData": {"title": (title or "Remix")[:100],
+                                                    "visibility": visibility if visibility in ("public", "unlisted", "private") else "public",
+                                                    "madeForKids": False}}],
+            "publishNow": True}
+    r = http_json(ZERNIO + "/posts", body, {"Authorization": "Bearer " + ZERNIO_KEY}, timeout=300)
+    p = (r.get("post") or {}).get("platforms") or [{}]
+    return p[0].get("platformPostUrl") or p[0].get("status") or "sent"
+
+
 # ------------------------------------------------------------------ the job
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024
@@ -644,7 +724,31 @@ def worker(jid, base, opts):
                      "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", final])
             else:
                 shutil.copy(joined, final)
-            job.update(status="done", progress=1.0, note="Done! Original sound is on the new video.")
+            shutil.copy(final, os.path.join(LIB_DIR, f"{jid}.mp4"))
+            fw, fh_ = dims(final)
+            secs = duration(final)
+            meta = dict(id=jid, created=time.time(), title=opts["title"] or "Remix", description=opts["description"],
+                        tags=opts["tags"], visibility=opts["vis"], test=bool(opts["test_first"]), seconds=secs,
+                        parts=n_run, model=_MODEL_CACHE.get("id", MODEL_ID), youtube=None)
+            lib_save(meta)
+            log(f"[remix {jid}] saved to the library ({secs:.0f}s, {fw}x{fh_})")
+            if opts["post_youtube"]:
+                if opts["test_first"]:
+                    log(f"[remix {jid}] test run: NOT posting to YouTube (untick Test run to post)")
+                else:
+                    try:
+                        job["note"] = "Posting to YouTube..."
+                        if fw > fh_ or secs > 180:
+                            log("[youtube] note: YouTube only treats a video as a Short if it is vertical and short enough")
+                        link = zernio_post(f"{base}/library/{jid}.mp4", meta["title"], meta["description"],
+                                           parse_tags(meta["tags"]), meta["visibility"])
+                        meta["youtube"] = {"url": link if str(link).startswith("http") else None, "status": str(link)}
+                        log(f"[youtube] posted: {link}")
+                    except Exception as e:  # noqa
+                        meta["youtube"] = {"error": str(e)[:300]}
+                        log(f"[youtube] FAILED: {str(e)[:400]}")
+                    lib_save(meta)
+            job.update(status="done", progress=1.0, note="Done! Saved under Saved videos below.")
             log(f"[remix {jid}] DONE")
     except Exception as e:  # noqa
         log(f"[remix {jid}] FAILED: {str(e)[:900]}")
@@ -725,7 +829,15 @@ def start():
                 simplify=request.form.get("simplify") == "on",
                 zone=request.form.get("zone") if request.form.get("zone") in ZONES else "none",
                 resolution=request.form.get("resolution") if request.form.get("resolution") in ("480p", "720p", "1080p") else "720p",
-                test_first=request.form.get("test_first") == "on")
+                test_first=request.form.get("test_first") == "on",
+                title=(request.form.get("title") or "").strip()[:100],
+                description=(request.form.get("description") or "").strip()[:2000],
+                tags=(request.form.get("tags") or "").strip()[:500],
+                vis=request.form.get("vis") if request.form.get("vis") in ("public", "unlisted", "private") else "public",
+                post_youtube=request.form.get("post_youtube") == "on")
+    if opts["post_youtube"] and not ZERNIO_KEY:
+        shutil.rmtree(wd, ignore_errors=True)
+        return jsonify(error="ZERNIO_API_KEY is not set on Railway, so I can't post to YouTube. Untick the box or set the key."), 400
     JOBS[jid] = dict(status="queued", progress=0.0, created=time.time(), note="Waiting in line...")
     log(f"[remix {jid}] uploaded: {d:.1f}s video, {len(imgs)} image(s), opts={opts}")
     threading.Thread(target=worker, args=(jid, public_base(), opts), daemon=True).start()
@@ -756,6 +868,62 @@ def result(jid):
     if jid not in JOBS or JOBS[jid]["status"] != "done" or not os.path.exists(p):
         abort(404)
     return send_file(p, mimetype="video/mp4", conditional=True)
+
+
+def _bad_pw():
+    return bool(PASSWORD) and not hmac.compare_digest(request.form.get("password", ""), PASSWORD)
+
+
+@app.get("/library")
+def library():
+    return jsonify(items=lib_list())
+
+
+@app.get("/library/<name>")
+def library_file(name):            # also the public link Zernio downloads the video from
+    if not re.fullmatch(r"[0-9a-f]{12}\.mp4", name):
+        abort(404)
+    p = os.path.join(LIB_DIR, name)
+    if not os.path.exists(p):
+        abort(404)
+    return send_file(p, mimetype="video/mp4", conditional=True)
+
+
+@app.post("/library/<vid>/post")
+def library_post(vid):
+    if _bad_pw():
+        return jsonify(error="Type the password first."), 403
+    m = lib_load(vid)
+    if not m:
+        return jsonify(error="Video not found."), 404
+    title = (request.form.get("title") or m.get("title") or "Remix").strip()[:100]
+    try:
+        link = zernio_post(f"{public_base()}/library/{vid}.mp4", title, m.get("description", ""),
+                           parse_tags(m.get("tags", "")), m.get("visibility", "public"))
+        m["title"] = title
+        m["youtube"] = {"url": link if str(link).startswith("http") else None, "status": str(link)}
+        log(f"[youtube] posted: {link}")
+    except Exception as e:  # noqa
+        m["youtube"] = {"error": str(e)[:300]}
+        lib_save(m)
+        log(f"[youtube] FAILED: {str(e)[:400]}")
+        return jsonify(error=str(e)[:300]), 500
+    lib_save(m)
+    return jsonify(url=m["youtube"]["url"], status=m["youtube"]["status"])
+
+
+@app.post("/library/<vid>/delete")
+def library_delete(vid):
+    if _bad_pw():
+        return jsonify(error="Type the password first."), 403
+    if not lib_load(vid):
+        return jsonify(error="Video not found."), 404
+    for ext in (".mp4", ".json"):
+        try:
+            os.remove(os.path.join(LIB_DIR, vid + ext))
+        except OSError:
+            pass
+    return jsonify(ok=True)
 
 
 @app.post("/login")
@@ -848,7 +1016,8 @@ def models_report():
 
 @app.get("/health")
 def health():
-    return f"ok | Krea login: {'connected' if AUTH['tokens'] else 'not connected'} | API key: {'set' if KREA_KEY else 'none'}"
+    return (f"ok | Krea login: {'connected' if AUTH['tokens'] else 'not connected'} | API key: {'set' if KREA_KEY else 'none'}"
+            f" | Zernio key: {'set' if ZERNIO_KEY else 'none'} | library: {LIB_DIR} ({len(lib_list())} videos)")
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -880,10 +1049,18 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div><label>Quality</label><select name="resolution"><option value="480p">480p (cheapest)</option><option value="720p" selected>720p</option><option value="1080p">1080p (most expensive)</option></select></div>
  </div>
  <div class="chk"><input type="checkbox" name="test_first" id="tf" checked><label for="tf" style="margin:0">Test run: only remix the first part (saves money while you check the look)</label></div>
+ <label>YouTube title</label><input name="title" maxlength="100" placeholder="Title for the Short">
+ <label>Description / hashtags</label><textarea name="description" rows="2" maxlength="2000" placeholder="Caption, #shorts #hashtags"></textarea>
+ <div class="row">
+  <div><label>Tags (comma separated)</label><input name="tags" placeholder="cartoon, remix, shorts"></div>
+  <div><label>Visibility</label><select name="vis"><option value="public">public</option><option value="unlisted">unlisted</option><option value="private">private</option></select></div>
+ </div>
+ <div class="chk"><input type="checkbox" name="post_youtube" id="py"><label for="py" style="margin:0">Post to YouTube Shorts when finished (skipped on test runs)</label></div>
  __PW__
  <button id="go">Remix my video</button>
 </form>
 <div class="bar" id="bar"><div id="fill"></div></div><div id="msg"></div><div id="out"></div>
+<h2 style="font-size:1rem;margin-top:26px">Saved videos</h2><div id="lib"></div>
 </div>
 <div id="side"><h2 style="font-size:1rem">Live log</h2><div id="log">Waiting for activity...</div></div></div>
 <script>
@@ -893,15 +1070,15 @@ f.addEventListener('submit',async e=>{
  try{
   const r=await fetch('/start',{method:'POST',body:new FormData(f)}); const j=await r.json();
   if(!r.ok){msg.textContent=j.error||'Something went wrong.'; go.disabled=false; bar.style.display='none'; return;}
-  poll(j.id);
+  localStorage.setItem('remix_job',j.id); poll(j.id);
  }catch(err){msg.textContent='Could not reach the server.'; go.disabled=false;}
 });
 async function poll(id){
  try{
-  const r=await fetch('/status/'+id); if(!r.ok) throw new Error('lost'); const j=await r.json();
+  const r=await fetch('/status/'+id); if(!r.ok){localStorage.removeItem('remix_job'); msg.textContent='That job is gone (the server restarted). Finished videos are under Saved videos.'; go.disabled=false; bar.style.display='none'; return;} const j=await r.json();
   msg.textContent=j.note||'';
-  if(j.status==='done'){fill.style.width='100%'; out.innerHTML='<video src="/result/'+id+'" controls autoplay loop playsinline></video><a class="dl" href="/result/'+id+'" download="remix.mp4">Download MP4</a>'; go.disabled=false; return;}
-  if(j.status==='error'){msg.textContent='Error: '+j.error; go.disabled=false; return;}
+  if(j.status==='done'){localStorage.removeItem('remix_job'); lib(); fill.style.width='100%'; out.innerHTML='<video src="/result/'+id+'" controls autoplay loop playsinline></video><a class="dl" href="/result/'+id+'" download="remix.mp4">Download MP4</a>'; go.disabled=false; return;}
+  if(j.status==='error'){localStorage.removeItem('remix_job'); msg.textContent='Error: '+j.error; go.disabled=false; return;}
   fill.style.width=Math.max(3,Math.round(j.progress*100))+'%'; setTimeout(()=>poll(id),2500);
  }catch(err){msg.textContent='Lost connection to the job. Try again.'; go.disabled=false;}
 }
@@ -930,6 +1107,43 @@ async function logs(){
  setTimeout(logs,1500);
 }
 logs();
+const libBox=document.getElementById('lib');
+function pw(){const p=f.querySelector('[name=password]');return p?p.value:'';}
+async function libAct(path,extra){
+ const fd=new FormData(); fd.append('password',pw()); for(const k in (extra||{})) fd.append(k,extra[k]);
+ const r=await fetch(path,{method:'POST',body:fd}); const j=await r.json().catch(()=>({}));
+ if(!r.ok){alert(j.error||'Something went wrong.'); return null;} return j;
+}
+function mkBtn(label,bg){const b=document.createElement('button'); b.textContent=label; b.style.cssText='margin:0;width:auto;padding:6px 12px;font-size:.85rem;background:'+bg; return b;}
+async function lib(){
+ try{
+  const j=await (await fetch('/library')).json(); libBox.innerHTML='';
+  if(!j.items.length){libBox.innerHTML='<small>Nothing saved yet. Finished videos appear here and stay after a refresh.</small>'; return;}
+  for(const it of j.items){
+   const d=document.createElement('div'); d.style.cssText='background:#181d33;border:1px solid #334;border-radius:10px;padding:10px;margin-top:12px';
+   const v=document.createElement('video'); v.src='/library/'+it.id+'.mp4'; v.controls=true; v.playsInline=true; v.preload='metadata'; d.appendChild(v);
+   const t=document.createElement('div'); t.style.cssText='margin-top:6px;font-size:.9rem';
+   t.textContent=(it.test?'[test] ':'')+it.title+' - '+Math.round(it.seconds)+'s - '+new Date(it.created*1000).toLocaleString(); d.appendChild(t);
+   const yt=document.createElement('div'); yt.style.cssText='font-size:.85rem;margin-top:4px';
+   if(it.youtube&&it.youtube.url){const a=document.createElement('a'); a.href=it.youtube.url; a.target='_blank'; a.textContent='Posted on YouTube'; a.className='dl'; a.style.margin='0'; yt.appendChild(a);}
+   else if(it.youtube&&it.youtube.error){yt.textContent='YouTube post failed: '+it.youtube.error; yt.style.color='#ff8a8a';}
+   else if(it.youtube){yt.textContent='YouTube: '+it.youtube.status;}
+   d.appendChild(yt);
+   const row=document.createElement('div'); row.style.cssText='display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center';
+   const dl=document.createElement('a'); dl.href='/library/'+it.id+'.mp4'; dl.download='remix.mp4'; dl.textContent='Download'; dl.className='dl'; dl.style.margin='0'; row.appendChild(dl);
+   const pb=mkBtn(it.youtube&&it.youtube.url?'Post again':'Post to YouTube','#3b6cff');
+   pb.onclick=async()=>{const title=prompt('YouTube title (max 100):',it.title); if(!title) return; pb.disabled=true; pb.textContent='Posting...';
+    const r=await libAct('/library/'+it.id+'/post',{title:title}); if(r) msg.textContent='Posted: '+(r.url||r.status); lib();};
+   row.appendChild(pb);
+   const xb=mkBtn('Delete','#8a2b2b');
+   xb.onclick=async()=>{if(!confirm('Delete this video?')) return; await libAct('/library/'+it.id+'/delete'); lib();};
+   row.appendChild(xb); d.appendChild(row); libBox.appendChild(d);
+  }
+ }catch(e){libBox.textContent='Could not load saved videos.';}
+}
+lib();
+const savedJob=localStorage.getItem('remix_job');
+if(savedJob){go.disabled=true; bar.style.display='block'; msg.textContent='Reconnecting to your running job...'; poll(savedJob);}
 </script></body></html>"""
 
 
@@ -940,6 +1154,7 @@ def index():
 
 
 _load_auth()
+print(f"Saved videos folder: {LIB_DIR}", flush=True)
 
 if __name__ == "__main__":
     if not shutil.which("ffmpeg"):
