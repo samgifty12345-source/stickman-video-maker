@@ -2,9 +2,9 @@
 Video Remix Bot - one file.
 
 You upload a video + a reference image of your main character. The bot:
-  1. cuts the video into short parts (Seedance 2.5 makes up to 30s per clip),
+  1. cuts the video into short parts (Seedance 2 makes 4-15s per clip),
   2. optionally blurs the caption area of each part,
-  3. sends each part to Seedance 2.5 on Krea as a *video edit* (same motion and story, new main character,
+  3. sends each part to Seedance 2 on Krea as a *video edit* (same motion and story, new main character,
      simpler side characters, changed colors and backgrounds, captions removed),
   4. joins the new parts and lays the ORIGINAL sound/voice back on top.
 
@@ -17,7 +17,7 @@ Environment variables:
                     survives redeploys. Default is a temp file (you click Login again after each deploy).
   APP_PASSWORD      optional but recommended: the connected Krea account is shared by everyone who opens the page.
   PUBLIC_URL        optional. e.g. https://my-app.up.railway.app  (Krea downloads your clip + images from it)
-  CHUNK_SECONDS     part length, default 15 (max 30)
+  CHUNK_SECONDS     part length, default 15 (max 15, Krea limit)
   MAX_VIDEO_SECONDS longest upload allowed, default 120
   SEEDANCE_ENDPOINT / SEEDANCE_MODEL  override the API path / MCP model id if Krea changes them
   SEEDANCE_TOOL     optional. Force the exact Krea MCP tool name used to make the video (e.g. generate_video).
@@ -48,13 +48,13 @@ from PIL import Image
 
 KREA = "https://api.krea.ai"
 KREA_KEY = os.environ.get("KREA_API_KEY", "")
-ENDPOINT = os.environ.get("SEEDANCE_ENDPOINT", "/generate/video/bytedance/seedance-2-5")
-MODEL_ID = os.environ.get("SEEDANCE_MODEL", "video/bytedance/seedance-2-5")
+ENDPOINT = os.environ.get("SEEDANCE_ENDPOINT", "/generate/video/bytedance/seedance-2")
+MODEL_ID = os.environ.get("SEEDANCE_MODEL", "video/bytedance/seedance-2")
 FORCED_TOOL = os.environ.get("SEEDANCE_TOOL", "").strip()
 MCP_URL = "https://api.krea.ai/mcp"
 TOKEN_FILE = os.environ.get("TOKEN_FILE", os.path.join(tempfile.gettempdir(), "krea_oauth.json"))
 PASSWORD = os.environ.get("APP_PASSWORD", "")
-CHUNK = max(5, min(30, int(os.environ.get("CHUNK_SECONDS", "15"))))
+CHUNK = max(5, min(15, int(os.environ.get("CHUNK_SECONDS", "15"))))   # Seedance 2 on Krea: 4-15s per clip
 MAX_VIDEO = int(os.environ.get("MAX_VIDEO_SECONDS", "120"))
 JOB_DIR = os.path.join(tempfile.gettempdir(), "remix_jobs")
 os.makedirs(JOB_DIR, exist_ok=True)
@@ -392,6 +392,8 @@ def oauth_generate(job, i, total, body):
             a[nest] = dict(body)
         else:
             a.update({k: v for k, v in body.items() if not props or k in props} if props else body)
+        if "sync" in props:
+            a["sync"] = False                      # we poll get_job ourselves
         if preflight and "preflight" in props:
             a["preflight"] = True
         return a
@@ -491,9 +493,17 @@ def build_prompt(style, simplify, idx, total):
     return p
 
 
-def generate_part(job, i, total, video_url, image_urls, prompt, resolution):
-    body = {"prompt": prompt, "reference_videos": [video_url], "reference_images": image_urls,
-            "resolution": resolution, "generate_audio": False}
+ASPECTS = {"16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "3:4": 3 / 4, "9:16": 9 / 16, "21:9": 21 / 9}
+
+
+def nearest_aspect(w, h):
+    r = w / h
+    return min(ASPECTS, key=lambda k: abs(ASPECTS[k] - r))
+
+
+def generate_part(job, i, total, video_url, image_urls, prompt, resolution, seconds, aspect):
+    body = {"prompt": prompt, "reference_videos": [video_url], "reference_images": image_urls[:9],
+            "resolution": resolution, "duration": max(4, min(15, round(seconds, 1))), "aspect_ratio": aspect}
     if AUTH["tokens"]:
         return oauth_generate(job, i, total, body)
     return api_generate(job, i, total, body)
@@ -533,8 +543,10 @@ def worker(jid, base, opts):
                 job["note"] = f"Part {i + 1}/{n_run}: preparing the clip..."
                 chunk = os.path.join(wd, f"chunk_{i + 1}.mp4")
                 make_chunk(src, chunk, i * length, length, opts["zone"])
+                cw, ch = dims(chunk)
                 url = generate_part(job, i + 1, n_run, f"{base}/files/{jid}/chunk_{i + 1}.mp4", image_urls,
-                                    build_prompt(opts["style"], opts["simplify"], i + 1, n_run), opts["resolution"])
+                                    build_prompt(opts["style"], opts["simplify"], i + 1, n_run), opts["resolution"],
+                                    length, nearest_aspect(cw, ch))
                 out = os.path.join(wd, f"out_{i + 1}.mp4")
                 download(url, out)
                 outs.append((chunk, out))
