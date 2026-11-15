@@ -599,6 +599,7 @@ def build_cfg(form):
     if ai_err:
         note = f"(AI unavailable: {ai_err}. Used keyword matching.) " + note
         warn = True
+    print(f"[build_cfg] prompt={prompt!r} ai={'yes' if ai else 'no'} err={ai_err} -> {desc}", flush=True)
     return dict(prompt=prompt, chaser=chaser, scene=scene, shirt=shirt, action=action, cape=cape_on,
                 speed={"slow": 0.7, "normal": 1.0, "fast": 1.3}[sp],
                 seconds=max(3, min(MAX_SECONDS, seconds)),
@@ -668,7 +669,8 @@ def video(jid):
 
 @app.get("/health")
 def health():
-    return "ok"
+    ai = "gemini" if GEMINI_KEY else "groq" if GROQ_KEY else "none (keywords only)"
+    return f"ok | AI: {ai}"
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
