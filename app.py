@@ -3,10 +3,9 @@ Video Remix Bot - one file.
 
 You upload a video + a reference image of your main character. The bot:
   1. cuts the video into short parts (Seedance 2 makes 4-15s per clip),
-  2. optionally blurs the caption area of each part,
-  3. sends each part to Seedance 2 on Krea as a *video edit* (same motion and story, new main character,
-     simpler side characters, changed colors and backgrounds, captions removed),
-  4. joins the new parts and lays the ORIGINAL sound/voice back on top.
+  2. sends each part to Seedance 2 on Krea as a *video edit* (same motion and story, your character as the
+     main character, new side characters made in its style, changed colors and backgrounds, captions removed),
+  3. joins the new parts and lays the ORIGINAL sound/voice back on top.
 
 Run on Railway: see the Dockerfile + requirements.txt next to this file.
 
@@ -114,15 +113,8 @@ def dims(p):
     return int(w), int(h)
 
 
-# caption zone -> (top fraction, height fraction) of the frame that gets blurred
-ZONES = {"bottom": (0.62, 0.38), "middle": (0.35, 0.30), "top": (0.0, 0.25)}
-
-
-def make_chunk(src, dst, start, length, zone):
+def make_chunk(src, dst, start, length):
     vf = "fps=30,scale=w='if(gt(iw,ih),1280,720)':h=-2"
-    if zone in ZONES:
-        y, h = ZONES[zone]
-        vf += (f",split[a][b];[b]crop=iw:ih*{h}:0:ih*{y},boxblur=25:3[bl];[a][bl]overlay=0:H*{y}")
     vf += ",format=yuv420p"
     run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", src,
          "-an", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", dst])
@@ -566,27 +558,24 @@ def api_generate(job, i, total, body):
 
 def build_prompt(style, simplify, idx, total):
     p = ("Edit the reference video: keep exactly the same story, actions, camera movement, framing, pacing and "
-         "timing as the reference video. Replace the main character with the character shown in the reference "
-         "image(s); keep that character's face, outfit and proportions identical in every shot. ")
+         "timing as the reference video. The reference image(s) show the MAIN character: replace the video's "
+         "main character with that character, keeping its design, outfit and art style, and keep the main "
+         "character looking the same in every shot. ")
     if simplify:
-        p += ("Every other character becomes a simpler, flatter, lower-detail design in the same art style as the "
-              "main character. ")
+        p += ("Create every other character in the video as a NEW, different character made for this story, "
+              "designed in the same art style and design language as the main character (same level of detail, "
+              "proportions and line work). Each one gets its own distinct face, outfit and look that fits their "
+              "role in the story. Do not copy the main character's face onto them. ")
+    else:
+        p += "Keep the other characters as they are in the reference video. "
     p += ("Change the color palette and redesign the backgrounds so the scene looks clearly different from the "
           "reference video, while the layout and action stay readable. ")
     if style:
         p += f"Style notes: {style}. "
     p += "Remove all captions, subtitles, on-screen text, watermarks and logos, and do not add any text."
     if total > 1:
-        p += f" This is part {idx} of {total} of one continuous video; keep the same look in every part."
+        p += f" This is part {idx} of {total} of one continuous video; keep the same characters and look in every part."
     return p
-
-
-ASPECTS = {"16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "3:4": 3 / 4, "9:16": 9 / 16, "21:9": 21 / 9}
-
-
-def nearest_aspect(w, h):
-    r = w / h
-    return min(ASPECTS, key=lambda k: abs(ASPECTS[k] - r))
 
 
 def generate_part(job, i, total, video_url, image_urls, prompt, resolution, seconds, aspect):
@@ -694,7 +683,7 @@ def worker(jid, base, opts):
                 job["progress"] = i / n_run
                 job["note"] = f"Part {i + 1}/{n_run}: preparing the clip..."
                 chunk = os.path.join(wd, f"chunk_{i + 1}.mp4")
-                make_chunk(src, chunk, i * length, length, opts["zone"])
+                make_chunk(src, chunk, i * length, length)
                 cw, ch = dims(chunk)
                 url = generate_part(job, i + 1, n_run, f"{base}/files/{jid}/chunk_{i + 1}.mp4", image_urls,
                                     build_prompt(opts["style"], opts["simplify"], i + 1, n_run), opts["resolution"],
@@ -827,7 +816,6 @@ def start():
         return jsonify(error=f"Could not read your files: {str(e)[:200]}"), 400
     opts = dict(style=(request.form.get("style") or "").strip()[:400],
                 simplify=request.form.get("simplify") == "on",
-                zone=request.form.get("zone") if request.form.get("zone") in ZONES else "none",
                 resolution=request.form.get("resolution") if request.form.get("resolution") in ("480p", "720p", "1080p") else "720p",
                 test_first=request.form.get("test_first") == "on",
                 title=(request.form.get("title") or "").strip()[:100],
@@ -1043,9 +1031,8 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <small>One clear picture is enough. More angles = more consistent character.</small>
  <label>3. What should change? (colors, backgrounds, style)</label>
  <textarea name="style" rows="3" maxlength="400" placeholder="e.g. neon purple and orange colors, new backgrounds: futuristic city and desert, flat cartoon look"></textarea>
- <div class="chk"><input type="checkbox" name="simplify" id="sm" checked><label for="sm" style="margin:0">Make the other characters simpler (based on the main character's style)</label></div>
+ <div class="chk"><input type="checkbox" name="simplify" id="sm" checked><label for="sm" style="margin:0">Create new other characters in the main character's style (not copies of its face)</label></div>
  <div class="row">
-  <div><label>Where are the captions in your video?</label><select name="zone"><option value="bottom">Bottom</option><option value="middle">Middle</option><option value="top">Top</option><option value="none">No captions</option></select></div>
   <div><label>Quality</label><select name="resolution"><option value="480p">480p (cheapest)</option><option value="720p" selected>720p</option><option value="1080p">1080p (most expensive)</option></select></div>
  </div>
  <div class="chk"><input type="checkbox" name="test_first" id="tf" checked><label for="tf" style="margin:0">Test run: only remix the first part (saves money while you check the look)</label></div>
