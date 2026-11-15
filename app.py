@@ -20,6 +20,7 @@ Environment variables:
   CHUNK_SECONDS     part length, default 15 (max 30)
   MAX_VIDEO_SECONDS longest upload allowed, default 120
   SEEDANCE_ENDPOINT / SEEDANCE_MODEL  override the API path / MCP model id if Krea changes them
+  SEEDANCE_TOOL     optional. Force the exact Krea MCP tool name used to make the video (e.g. generate_video).
   PORT              set by Railway
 """
 import base64
@@ -49,6 +50,7 @@ KREA = "https://api.krea.ai"
 KREA_KEY = os.environ.get("KREA_API_KEY", "")
 ENDPOINT = os.environ.get("SEEDANCE_ENDPOINT", "/generate/video/bytedance/seedance-2-5")
 MODEL_ID = os.environ.get("SEEDANCE_MODEL", "video/bytedance/seedance-2-5")
+FORCED_TOOL = os.environ.get("SEEDANCE_TOOL", "").strip()
 MCP_URL = "https://api.krea.ai/mcp"
 TOKEN_FILE = os.environ.get("TOKEN_FILE", os.path.join(tempfile.gettempdir(), "krea_oauth.json"))
 PASSWORD = os.environ.get("APP_PASSWORD", "")
@@ -327,36 +329,76 @@ class Mcp:
             raise RuntimeError(f"Krea tool error: {str(data)[:300]}")
         return data
 
-    def tool(self, name):
+    def tool_map(self):
         if self.tools is None:
-            self.tools = {t["name"]: t for t in self.rpc("tools/list").get("tools", [])}
-        if name not in self.tools:
-            raise RuntimeError(f"Krea MCP has no '{name}' tool (has: {', '.join(self.tools)})")
-        return self.tools[name]
+            tools, cursor = {}, None
+            while True:
+                res = self.rpc("tools/list", {"cursor": cursor} if cursor else {})
+                tools.update({t["name"]: t for t in res.get("tools", [])})
+                cursor = res.get("nextCursor")
+                if not cursor:
+                    break
+            self.tools = tools
+        return self.tools
+
+    def tool(self, name):
+        tm = self.tool_map()
+        if name not in tm:
+            raise RuntimeError(f"Krea MCP has no '{name}' tool. Tools: {', '.join(tm)}")
+        return tm[name]
+
+    def pick_generate_tool(self):
+        """Krea renames tools now and then, so find the one that makes videos."""
+        tm = self.tool_map()
+        names = list(tm)
+        if FORCED_TOOL:
+            if FORCED_TOOL in tm:
+                return FORCED_TOOL
+            raise RuntimeError(f"SEEDANCE_TOOL='{FORCED_TOOL}' is not a Krea tool. Tools: {', '.join(names)}")
+        for n in ("generate", "generate_video", "video_generate", "create_video", "generate_media"):
+            if n in tm:
+                return n
+        skip = ("ad_studio", "brand", "node", "swap", "style", "agent", "desktop", "token", "job", "plan", "balance")
+        pool = [n for n in names if not any(s in n for s in skip)]
+        for pred in (lambda n: "generate" in n and "video" in n,
+                     lambda n: "video" in n and ("create" in n or "make" in n or "edit" in n),
+                     lambda n: n.startswith("generate")):
+            hit = [n for n in pool if pred(n)]
+            if hit:
+                return hit[0]
+        raise RuntimeError("Could not find a video tool on Krea's MCP server. Tools: " + ", ".join(names)
+                           + ". Set SEEDANCE_TOOL to the right name.")
 
 
 def oauth_generate(job, i, total, body):
     m = Mcp()
-    gen = m.tool("generate")
+    gname = m.pick_generate_tool()
+    gen = m.tool(gname)
     props = (gen.get("inputSchema") or {}).get("properties", {})
     if i == 1:
-        log(f"[remix] Krea 'generate' tool takes: {', '.join(props)}")
-    mk = next((k for k in ("model", "model_id", "modelId") if k in props), "model")
+        log(f"[remix] using Krea tool '{gname}'")
+        log(f"[remix] it takes: {', '.join(props) or '(no schema given)'}")
+        log(f"[remix] all Krea tools: {', '.join(m.tool_map())}")
+    mk = next((k for k in ("model", "model_id", "modelId") if k in props), None)
     nest = next((k for k in ("params", "parameters", "input", "inputs", "body", "arguments") if k in props), None)
 
     def args(preflight=False):
-        a = {mk: MODEL_ID}
+        a = {}
+        if mk:
+            a[mk] = MODEL_ID
+        elif not props:
+            a["model"] = MODEL_ID
         if nest:
             a[nest] = dict(body)
         else:
-            a.update(body)
-        if preflight:
+            a.update({k: v for k, v in body.items() if not props or k in props} if props else body)
+        if preflight and "preflight" in props:
             a["preflight"] = True
         return a
 
-    if i == 1:                                   # price check before spending anything
+    if i == 1 and "preflight" in props:          # price check before spending anything
         try:
-            q = m.call("generate", args(True))
+            q = m.call(gname, args(True))
             cu, have = find_key(q, ("compute_units",)), find_key(q, ("available_compute_units",))
             log(f"[remix] cost quote: about {cu} compute units per part, you have {have}")
             if find_key(q, ("affordable",)) is False:
@@ -365,7 +407,11 @@ def oauth_generate(job, i, total, body):
             if "Not enough" in str(e):
                 raise
             log(f"[remix] cost quote skipped: {e}")
-    data = m.call("generate", args())
+    if i == 1:
+        dropped = [k for k in body if props and not nest and k not in props]
+        if dropped:
+            log(f"[remix] WARNING: this Krea tool has no field for: {', '.join(dropped)} (not sent)")
+    data = m.call(gname, args())
     url = find_video_url(data)
     jid = find_key(data, ("job_id", "jobId", "id"))
     if url and not jid:
@@ -515,8 +561,9 @@ def worker(jid, base, opts):
             job.update(status="done", progress=1.0, note="Done! Original sound is on the new video.")
             log(f"[remix {jid}] DONE")
     except Exception as e:  # noqa
-        log(f"[remix {jid}] FAILED: {traceback.format_exc()[-700:]}")
-        job.update(status="error", error=str(e))
+        log(f"[remix {jid}] FAILED: {str(e)[:900]}")
+        print(traceback.format_exc(), flush=True)
+        job.update(status="error", error=str(e)[:900])
 
 
 def cleanup():
