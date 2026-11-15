@@ -622,40 +622,50 @@ def _gemini(system, user, temp, timeout, tag):
     raise RuntimeError(f"Gemini overloaded or unavailable ({last})")
 
 
-def llm_json(system, user, temp=0.2, timeout=20, tag="ai"):
-    """Ask Gemini (then Groq as backup) for a JSON object. Returns (dict or None, error text or None). Never raises."""
+def llm_json(system, user, temp=0.2, timeout=20, tag="ai", provider="auto", info=None):
+    """Ask Gemini and/or Groq for a JSON object. provider: auto (Gemini, Groq as backup) | gemini | groq.
+    Returns (dict or None, error text or None). Never raises. info["provider"] = who answered."""
     t0 = time.time()
+    info = info if info is not None else {}
     try:
         text, errs = None, []
-        if GEMINI_KEY:
-            try:
-                text = _gemini(system, user, temp, timeout, tag)
-            except RuntimeError as e:
-                errs.append(str(e))
-                log(f"[{tag}] {e}")
-        if text is None and GROQ_KEY:
-            log(f"[{tag}] sending to Groq {GROQ_MODEL} (wait up to {timeout}s)")
-            try:
-                data = _post_json("https://api.groq.com/openai/v1/chat/completions",
-                                  {"Authorization": "Bearer " + GROQ_KEY},
-                                  {"model": GROQ_MODEL, "temperature": temp, "max_tokens": 6000,
-                                   "response_format": {"type": "json_object"},
-                                   "messages": [{"role": "system", "content": system},
-                                                {"role": "user", "content": user}]}, min(timeout, 40))
-                text = data["choices"][0]["message"]["content"]
-            except urllib.error.HTTPError as e:
-                msg = re.sub(r"\s+", " ", e.read().decode(errors="ignore"))[:200]
-                log(f"[{tag}] Groq answered HTTP {e.code}: {msg}")
-                errs.append(f"Groq HTTP {e.code}")
-            except OSError as e:
-                log(f"[{tag}] Groq no answer ({type(e).__name__})")
-                errs.append("Groq timed out")
+        if provider in ("auto", "gemini"):
+            if GEMINI_KEY:
+                try:
+                    text = _gemini(system, user, temp, timeout, tag)
+                    info["provider"] = "Gemini"
+                except RuntimeError as e:
+                    errs.append(str(e))
+                    log(f"[{tag}] {e}")
+            elif provider == "gemini":
+                return None, "GEMINI_API_KEY is not set in Railway"
+        if text is None and provider in ("auto", "groq"):
+            if GROQ_KEY:
+                log(f"[{tag}] sending to Groq {GROQ_MODEL} (wait up to {min(timeout, 40)}s)")
+                try:
+                    data = _post_json("https://api.groq.com/openai/v1/chat/completions",
+                                      {"Authorization": "Bearer " + GROQ_KEY},
+                                      {"model": GROQ_MODEL, "temperature": temp, "max_tokens": 6000,
+                                       "response_format": {"type": "json_object"},
+                                       "messages": [{"role": "system", "content": system},
+                                                    {"role": "user", "content": user}]}, min(timeout, 40))
+                    text = data["choices"][0]["message"]["content"]
+                    info["provider"] = "Groq"
+                except urllib.error.HTTPError as e:
+                    msg = re.sub(r"\s+", " ", e.read().decode(errors="ignore"))[:200]
+                    log(f"[{tag}] Groq answered HTTP {e.code}: {msg}")
+                    errs.append(f"Groq HTTP {e.code}")
+                except OSError as e:
+                    log(f"[{tag}] Groq no answer ({type(e).__name__})")
+                    errs.append("Groq timed out")
+            elif provider == "groq":
+                return None, "GROQ_API_KEY is not set in Railway"
         if text is None:
             if not (GEMINI_KEY or GROQ_KEY):
                 log(f"[{tag}] no AI key set")
                 return None, None
             return None, "; ".join(errs) or "no answer"
-        log(f"[{tag}] reply after {time.time() - t0:.1f}s, {len(text)} chars: {text[:160]!r}")
+        log(f"[{tag}] reply from {info.get('provider')} after {time.time() - t0:.1f}s, {len(text)} chars: {text[:160]!r}")
         text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
         i, j = text.find("{"), text.rfind("}")
         if i >= 0 and j > i:
@@ -825,17 +835,20 @@ def clean_spec(raw):
     return spec if spec["actors"] else None
 
 
-def ask_scene(prompt, orientation):
+def ask_scene(prompt, orientation, provider="auto"):
     last = None
     for n in (1, 2):
-        log(f"[scene] attempt {n}: asking the AI to draw {prompt!r} ({orientation})")
-        raw, err = llm_json(SCENE_SYSTEM, f"Canvas: {orientation}. Idea: {prompt}", 0.5, 30, tag="scene")
+        log(f"[scene] attempt {n}: asking {provider} to draw {prompt!r} ({orientation})")
+        info = {}
+        raw, err = llm_json(SCENE_SYSTEM, f"Canvas: {orientation}. Idea: {prompt}", 0.5, 30,
+                            tag="scene", provider=provider, info=info)
         if err:
             return None, err
         spec = clean_spec(raw) if raw else None
         if spec:
+            spec["by"] = info.get("provider", "AI")
             n_parts = sum(len(a["parts"]) for a in spec["actors"])
-            log(f"[scene] checked the drawing: {len(spec['actors'])} objects, {n_parts} shapes, OK")
+            log(f"[scene] {spec['by']} drew {len(spec['actors'])} objects, {n_parts} shapes, OK")
             return spec, None
         last = "the AI reply had no usable drawing"
         log(f"[scene] {last}; keys in reply: {list(raw)[:8] if raw else None}")
@@ -960,9 +973,10 @@ def build_cfg(form):
     pre = ""
     if (form.get("mode") or "ai") == "ai" and prompt:
         if GEMINI_KEY or GROQ_KEY:
-            log(f"[plan] mode=AI draws it, provider={'Gemini ' + GEMINI_MODEL if GEMINI_KEY else 'Groq ' + GROQ_MODEL}")
+            eng = form.get("engine") if form.get("engine") in ("gemini", "groq") else "auto"
+            log(f"[plan] mode=AI draws it, engine={eng}")
             ori = form.get("orientation") if form.get("orientation") in SIZES else "vertical"
-            spec, err = ask_scene(prompt, ori)
+            spec, err = ask_scene(prompt, ori, eng)
             if spec:
                 try:
                     seconds = int(form.get("seconds") or 8)
@@ -973,7 +987,7 @@ def build_cfg(form):
                 log(f"[plan] using the AI drawing: {len(spec['actors'])} objects, {n} shapes, {seconds}s, {ori}, {q}")
                 return dict(prompt=prompt, spec=spec, seconds=max(3, min(MAX_SECONDS, seconds)),
                             orientation=ori, quality=q, caption=form.get("caption") == "on",
-                            note=f"AI drew your idea: {len(spec['actors'])} objects, {n} shapes.", warn=False)
+                            note=f"{spec['by']} drew your idea: {len(spec['actors'])} objects, {n} shapes.", warn=False)
             log(f"[plan] AI drawing failed: {err}")
             raise RuntimeError(f"The AI could not draw this: {err}. Click Generate again in a minute, "
                                "or set Mode to Built-in stickman.")
@@ -988,8 +1002,30 @@ def build_cfg(form):
     return cfg
 
 
+# ================================================================= key check
+def _check_one(prov, key, name):
+    if not key:
+        log(f"[startup] {name}: no key set (add {name.upper()}_API_KEY in Railway to use it)")
+        return
+    out, err = llm_json('Reply with ONLY a JSON object like {"reply": "..."}.',
+                        "If you can read this message, your API key works. Reply with the words I'm ready "
+                        "followed by your own name, for example I'm ready Gemini or I'm ready Groq.",
+                        0.2, 30, tag=f"startup {name}", provider=prov)
+    if out:
+        log(f"[startup] {name} says: {out.get('reply', out)}   <- key works")
+    else:
+        log(f"[startup] {name} FAILED: {err}")
+
+
+def selftest():
+    log("[startup] checking the AI keys before any work...")
+    for prov, key, name in (("gemini", GEMINI_KEY, "Gemini"), ("groq", GROQ_KEY, "Groq")):
+        threading.Thread(target=_check_one, args=(prov, key, name), daemon=True).start()
+
+
 # ====================================================================== web app
 app = Flask(__name__)
+_LAST_TEST = [0.0]
 JOBS = {}
 RENDER_LOCK = threading.Semaphore(1)      # one render at a time keeps memory low
 
@@ -1010,7 +1046,7 @@ def worker(jid, form):
     try:
         job["status"] = "thinking"
         log(f"[job {jid}] started: {form.get('prompt')!r}, mode={form.get('mode', 'ai')}, "
-            f"{form.get('orientation')}, {form.get('seconds')}s, quality={form.get('quality')}")
+            f"engine={form.get('engine', 'auto')}, {form.get('orientation')}, {form.get('seconds')}s, quality={form.get('quality')}")
         cfg = build_cfg(form)
         job.update(note=cfg["note"], warn=cfg["warn"])
         log(f"[job {jid}] plan ready: {cfg['note']}")
@@ -1051,6 +1087,15 @@ def generate():
     JOBS[jid] = dict(status="queued", progress=0.0, created=time.time(), note="", warn=False)
     threading.Thread(target=worker, args=(jid, request.form.to_dict()), daemon=True).start()
     return jsonify(id=jid)
+
+
+@app.post("/selftest")
+def selftest_route():
+    if time.time() - _LAST_TEST[0] < 20:
+        return jsonify(ok=False, error="wait a few seconds")
+    _LAST_TEST[0] = time.time()
+    selftest()
+    return jsonify(ok=True)
 
 
 @app.get("/logs")
@@ -1106,6 +1151,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <label>What do you want to see?</label>
  <textarea name="prompt" rows="3" maxlength="200">a stickman running from a dragon at night</textarea>
  <label>Mode</label><select name="mode"><option value="ai">AI draws it (any idea)</option><option value="builtin">Built-in stickman (menus below)</option></select>
+ <label>AI engine (for the drawing)</label><select name="engine"><option value="auto">Auto: Gemini, Groq as backup</option><option value="gemini">Gemini only</option><option value="groq">Groq only</option></select>
  <div class="row">
   <div><label>Chaser</label><select name="chaser"><option value="auto">Auto (from my text)</option><option value="dragon">Dragon</option><option value="ghost">Ghost</option><option value="none">None</option></select></div>
   <div><label>Scene</label><select name="scene"><option value="auto">Auto (from my text)</option><option value="meadow">Meadow</option><option value="desert">Desert</option><option value="night">Night</option><option value="snow">Snow</option></select></div>
@@ -1124,7 +1170,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 </form>
 <div id="note"></div><div class="bar" id="bar"><div id="fill"></div></div><div id="msg"></div><div id="out"></div>
 </div>
-<div id="side"><h2><span>Live log</span><button type="button" id="clr">Clear view</button></h2><div id="log">Waiting for activity...</div></div></div>
+<div id="side"><h2><span>Live log</span><span><button type="button" id="tst">Test AI keys</button> <button type="button" id="clr">Clear view</button></span></h2><div id="log">Waiting for activity...</div></div></div>
 <script>
 const f=document.getElementById('f'),go=document.getElementById('go'),bar=document.getElementById('bar'),
 fill=document.getElementById('fill'),msg=document.getElementById('msg'),note=document.getElementById('note'),out=document.getElementById('out');
@@ -1153,13 +1199,14 @@ async function poll(id){
 }
 let lastLog=0; const logEl=document.getElementById('log');
 document.getElementById('clr').onclick=()=>{logEl.innerHTML='';};
+document.getElementById('tst').onclick=()=>fetch('/selftest',{method:'POST'});
 async function pollLogs(){
  try{
   const r=await fetch('/logs?since='+lastLog); const j=await r.json();
   if(j.lines.length&&lastLog===0) logEl.innerHTML='';
   for(const [n,l] of j.lines){
    const d=document.createElement('div'); d.textContent=l;
-   if(/error|failed|traceback|HTTP [45]/i.test(l)) d.className='err'; else if(/DONE|OK$|using the AI drawing/.test(l)) d.className='ok';
+   if(/error|failed|traceback|HTTP [45]/i.test(l)) d.className='err'; else if(/DONE|OK$|using the AI drawing|key works/.test(l)) d.className='ok';
    logEl.appendChild(d); lastLog=n;
   }
   if(j.lines.length) logEl.scrollTop=logEl.scrollHeight;
@@ -1175,6 +1222,8 @@ def index():
     pw = '<label>Password</label><input type="password" name="password" required>' if PASSWORD else ""
     return PAGE.replace("__PW__", pw).replace("__MAX__", str(MAX_SECONDS))
 
+
+selftest()      # runs once when the server starts (also under gunicorn)
 
 if __name__ == "__main__":
     if not shutil.which("ffmpeg"):
