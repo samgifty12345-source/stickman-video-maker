@@ -779,6 +779,48 @@ def logs():
     return jsonify(lines=[x for x in items if x[0] > since])
 
 
+def _walk_models(o, out):
+    if isinstance(o, dict):
+        mid = o.get("model") or o.get("id") or o.get("modelId")
+        if isinstance(mid, str) and "/" in mid and (o.get("category") in (None, "video") or "video" in json.dumps(o)[:300].lower()):
+            out.setdefault(mid, o)
+        for v in o.values():
+            _walk_models(v, out)
+    elif isinstance(o, list):
+        for v in o:
+            _walk_models(v, out)
+
+
+@app.get("/models")
+def models_report():
+    """Open /models in the browser: lists every Krea video model and whether it accepts a reference video."""
+    if not AUTH["tokens"]:
+        return "Click Login with Krea on the main page first.", 400, {"Content-Type": "text/plain"}
+    try:
+        m = Mcp()
+        lp = (m.tool("list_models").get("inputSchema") or {}).get("properties", {})
+        raw = m.call("list_models", {k: v for k, v in {"category": "video", "type": "video"}.items() if k in lp})
+        found = {}
+        _walk_models(raw, found)
+        sp = (m.tool("get_model_schema").get("inputSchema") or {}).get("properties", {})
+        key = next((k for k in ("model", "model_id", "modelId", "id") if k in sp), "model")
+        rows = []
+        for mid, info in sorted(found.items()):
+            try:
+                sch = m.call("get_model_schema", {key: mid})
+                props = (sch.get("inputSchema") or {}).get("properties", {})
+                ok = "reference_videos" in props or "reference_video" in props or "video" in props or "video_url" in props
+                vid_fields = [p for p in props if "video" in p]
+                price = {k: v for k, v in info.items() if "pric" in k.lower() or "cost" in k.lower() or "compute" in k.lower()}
+                rows.append(f"{'YES' if ok else 'no ':3} | {mid} | video inputs: {', '.join(vid_fields) or '-'} | {json.dumps(price) if price else ''}")
+            except Exception as e:  # noqa
+                rows.append(f"?   | {mid} | schema failed: {str(e)[:80]}")
+        head = f"{len(rows)} video models found\n\n" if rows else "No models parsed. Raw list_models reply:\n" + json.dumps(raw)[:3000]
+        return head + "\n".join(rows), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as e:  # noqa
+        return f"Failed: {e}", 500, {"Content-Type": "text/plain"}
+
+
 @app.get("/health")
 def health():
     return f"ok | Krea login: {'connected' if AUTH['tokens'] else 'not connected'} | API key: {'set' if KREA_KEY else 'none'}"
