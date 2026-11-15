@@ -639,6 +639,25 @@ def public_base():
     return f"{proto}://{request.headers.get('X-Forwarded-Host', request.host)}"
 
 
+def fit_reference(im):
+    """Seedance wants reference images with aspect ratio 0.4-2.5 and a decent size: pad/upscale if needed."""
+    w, h = im.size
+    lo, hi = 0.5, 2.0                                   # stay safely inside 0.4-2.5
+    r = w / h
+    if r > hi or r < lo:
+        nw, nh = (w, math.ceil(w / hi)) if r > hi else (math.ceil(h * lo), h)
+        bg = im.getpixel((0, 0))                         # fill with the picture's corner colour
+        canvas = Image.new("RGB", (nw, nh), bg)
+        canvas.paste(im, ((nw - w) // 2, (nh - h) // 2))
+        im = canvas
+    w, h = im.size
+    if min(w, h) < 512:                                  # tiny images get rejected: scale up
+        sc = 512 / min(w, h)
+        im = im.resize((round(w * sc), round(h * sc)), Image.LANCZOS)
+    im.thumbnail((1536, 1536))
+    return im
+
+
 @app.post("/start")
 def start():
     if PASSWORD and not hmac.compare_digest(request.form.get("password", ""), PASSWORD):
@@ -668,8 +687,7 @@ def start():
         if d > MAX_VIDEO:
             raise RuntimeError(f"The video is {d:.0f}s; the limit is {MAX_VIDEO}s (MAX_VIDEO_SECONDS).")
         for k, f in enumerate(imgs[:8], 1):
-            im = Image.open(f.stream).convert("RGB")
-            im.thumbnail((1536, 1536))
+            im = fit_reference(Image.open(f.stream).convert("RGB"))
             im.save(os.path.join(wd, f"ref_{k}.jpg"), quality=92)
     except Exception as e:  # noqa
         shutil.rmtree(wd, ignore_errors=True)
