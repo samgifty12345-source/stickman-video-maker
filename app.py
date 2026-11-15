@@ -589,13 +589,12 @@ def parse_subs(raw):
                 break
     if cues:
         return cues
-    t = 0.0                                   # no timestamps: one cue per line, timed by length
-    for l in raw.split("\n"):
-        l = l.strip()
-        if l:
-            d = max(1.5, len(l.split()) / 2.6)
-            cues.append(dict(start=t, end=t + d, text=l))
-            t += d + 0.25
+    # no timestamps: plain text -> drop [music] / (notes), join broken lines, one cue per sentence
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", raw)
+    text = re.sub(r"\s+", " ", text).strip()
+    for s_ in re.split(r"(?<=[.!?])\s+", text):
+        if s_.strip():
+            cues.append(dict(start=0.0, end=0.0, text=s_.strip(), auto=True))
     return cues
 
 
@@ -652,11 +651,15 @@ def dub_worker(jid, form):
             raw, clip = os.path.join(wd, f"raw{n}.mp3"), os.path.join(wd, f"clip_{n:03d}.wav")
             tts(c["text"], voice, rate, raw)
             d = audio_len(raw)
-            slot = max(0.5, c["end"] - c["start"])
+            auto = c.get("auto")                         # untimed text: keep the natural speed
+            slot = 999 if auto else max(0.5, c["end"] - c["start"])
             f = min(2.0, max(1.0, d / slot))            # speed up (max 2x) when the line is too long for its slot
             ff("-i", raw, "-af", (f"atempo={f:.4f}," if f > 1.01 else "") + "aresample=44100", "-ac", "1", clip)
             length = audio_len(clip)
-            start = max(c["start"], cursor)             # if a line overruns, the next one waits for it
+            if auto:
+                start = cursor + (0.3 if n > 1 else 0.0)  # natural pause between sentences
+            else:
+                start = max(c["start"], cursor)         # if a line overruns, the next one waits for it
             if start - cursor > 0.02:
                 sil = os.path.join(wd, f"gap{n}.wav")
                 ff("-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", f"{start - cursor:.3f}", sil)
