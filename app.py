@@ -500,8 +500,10 @@ class AIScene:
             x, y, dirx = self.pos(a, t)
             fl = -1 if (a["face"] and dirx < 0) else 1
             ax = x * self.W
-            ay = y * self.H + a["bob"] * self.H * math.sin(2 * math.pi * a["bob_speed"] * t)
             k = a["scale"] * self.u
+            ay = y * self.H + a["bob"] * self.H * math.sin(2 * math.pi * a["bob_speed"] * t)
+            if a.get("on_ground") and self.spec["ground"]:
+                ay = self.spec["ground_y"] * self.H - a["feet"] * k + a["bob"] * self.H * math.sin(2 * math.pi * a["bob_speed"] * t)
             for p in a["parts"]:
                 pp = [((ax + fl * qx * k) * S, (ay + qy * k) * S) for qx, qy in self.xform(p, t)]
                 w = max(1, round(p["ow"] * k * S))
@@ -555,9 +557,9 @@ def render(cfg, out_path, progress):
 
 # ================================================================= AI brain (optional)
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 AI_SYSTEM = (
     "You turn a user's idea for a short stickman animation into settings for a small drawing program. "
@@ -583,7 +585,7 @@ def _post_json(url, headers, body, timeout=20):
 
 def _gemini(system, user, temp, timeout, tag):
     """Try Gemini models in turn, retrying when Google is overloaded. Returns text or raises RuntimeError."""
-    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]))
+    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]))
     dead, last = set(), "no model answered"
     for rnd in (1, 2):
         for model in models:
@@ -641,23 +643,28 @@ def llm_json(system, user, temp=0.2, timeout=20, tag="ai", provider="auto", info
                 return None, "GEMINI_API_KEY is not set in Railway"
         if text is None and provider in ("auto", "groq"):
             if GROQ_KEY:
-                log(f"[{tag}] sending to Groq {GROQ_MODEL} (wait up to {min(timeout, 40)}s)")
-                try:
-                    data = _post_json("https://api.groq.com/openai/v1/chat/completions",
-                                      {"Authorization": "Bearer " + GROQ_KEY},
-                                      {"model": GROQ_MODEL, "temperature": temp, "max_tokens": 6000,
-                                       "response_format": {"type": "json_object"},
-                                       "messages": [{"role": "system", "content": system},
-                                                    {"role": "user", "content": user}]}, min(timeout, 40))
-                    text = data["choices"][0]["message"]["content"]
-                    info["provider"] = "Groq"
-                except urllib.error.HTTPError as e:
-                    msg = re.sub(r"\s+", " ", e.read().decode(errors="ignore"))[:200]
-                    log(f"[{tag}] Groq answered HTTP {e.code}: {msg}")
-                    errs.append(f"Groq HTTP {e.code}")
-                except OSError as e:
-                    log(f"[{tag}] Groq no answer ({type(e).__name__})")
-                    errs.append("Groq timed out")
+                for gm in dict.fromkeys([GROQ_MODEL, "openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"]):
+                    body = {"model": gm, "temperature": temp, "max_tokens": 8000,
+                            "response_format": {"type": "json_object"},
+                            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+                    if "gpt-oss" in gm:
+                        body["reasoning_effort"] = "low"
+                    log(f"[{tag}] sending to Groq {gm} (wait up to {min(timeout, 40)}s)")
+                    try:
+                        data = _post_json("https://api.groq.com/openai/v1/chat/completions",
+                                          {"Authorization": "Bearer " + GROQ_KEY}, body, min(timeout, 40))
+                        text = data["choices"][0]["message"]["content"]
+                        info["provider"] = "Groq"
+                        break
+                    except urllib.error.HTTPError as e:
+                        msg = re.sub(r"\s+", " ", e.read().decode(errors="ignore"))[:200]
+                        log(f"[{tag}] Groq {gm} answered HTTP {e.code}: {msg}")
+                        errs.append(f"Groq HTTP {e.code}")
+                        if e.code in (401, 403):
+                            break
+                    except OSError as e:
+                        log(f"[{tag}] Groq {gm} no answer ({type(e).__name__})")
+                        errs.append("Groq timed out")
             elif provider == "groq":
                 return None, "GROQ_API_KEY is not set in Railway"
         if text is None:
@@ -703,6 +710,15 @@ SCENE_SYSTEM = (
     '{"shape":"polygon","points":[[x,y],[x,y],[x,y]],"fill":"#hex"} ; '
     '{"shape":"line","points":[[x,y],[x,y],...],"width":8,"color":"#hex"} (open line, good for legs, arms, stems). '
     "outline defaults to near-black; use \"outline\":null for none.\n"
+    "READY-MADE PERSON (use this for every human, stickman, hero or villain; it is drawn correctly with a face, "
+    "limbs and walking/flying animation, so never draw people from loose shapes): "
+    '{"stamp":"person","pose":"stand|walk|run|fly","x":..,"y":..,"scale":1.3,"shirt":"#hex","pants":"#hex","skin":"#hex",'
+    '"hair":"#hex","boots":"#hex","cape":"#hex or omit","emblem":"#hex or omit","motion":{...}}. '
+    "Standing/walking/running people automatically stand on the ground line (ignore their y). Pose fly is a "
+    "horizontal flying pose (use y and waypoints). A superhero like Superman = pose fly, shirt #1f4fd8, pants #d62828, "
+    "boots #d62828, cape #d62828, emblem #ffd60a. Always face right and use motion.face to turn. You may add extra "
+    "parts to a person (a hat, a prop); their local coordinates: hip is (0,0), head top about y=-140, feet about y=108 "
+    "when upright; when flying the body spans x=-170..140.\n"
     "PART animation (optional, one per part): "
     '"anim":{"type":"swing|spin|bob|sway|pulse","amp":number,"speed":cycles per second,"phase":radians,"pivot":[x,y]}. '
     "swing rotates back and forth by amp degrees around pivot (wings, legs, arms, tails: put the pivot at the "
@@ -767,6 +783,101 @@ def _ell(cx, cy, rx, ry, rot):
     return out
 
 
+# ================================================================= ready-made characters (stamps)
+OUT = "#141414"
+
+
+def _limb(P, pts, col, w, anim=None):
+    o = {"shape": "line", "points": pts, "width": w + 8, "color": OUT}
+    c = {"shape": "line", "points": pts, "width": w, "color": col}
+    if anim:
+        o["anim"], c["anim"] = dict(anim), dict(anim)
+    P += [o, c]
+
+
+def _face(P, hx, hy, skin, hair):
+    P += [{"shape": "circle", "cx": hx - 5, "cy": hy - 6, "r": 31, "fill": hair},
+          {"shape": "circle", "cx": hx + 3, "cy": hy + 2, "r": 28, "fill": skin},
+          {"shape": "polygon", "points": [[hx - 24, hy - 8], [hx - 6, hy - 30], [hx + 22, hy - 24], [hx + 28, hy - 10],
+                                          [hx + 10, hy - 18], [hx - 6, hy - 12]], "fill": hair, "outline": None},
+          {"shape": "circle", "cx": hx + 14, "cy": hy + 2, "r": 3.5, "fill": OUT, "outline": None},
+          {"shape": "circle", "cx": hx + 26, "cy": hy + 2, "r": 3.5, "fill": OUT, "outline": None},
+          {"shape": "line", "points": [[hx + 12, hy + 14], [hx + 20, hy + 18], [hx + 30, hy + 12]], "width": 3.5, "color": OUT}]
+
+
+def stamp_person(a):
+    def col(k, d):
+        v = a.get(k, d)
+        return None if v in (None, "", "none") else v
+    skin, hair = col("skin", "#ffe0bd"), col("hair", "#2b2b2b")
+    shirt, pants, boots = col("shirt", "#e63946"), col("pants", "#3a5fcd"), col("boots", "#222222")
+    cape, emblem = col("cape", None), col("emblem", None)
+    pose = a.get("pose") if a.get("pose") in ("stand", "walk", "run", "fly") else "stand"
+    P = []
+    if pose != "fly":
+        sp = {"stand": 0, "walk": 1.4, "run": 2.6}[pose]
+        amp = {"stand": 0, "walk": 28, "run": 45}[pose]
+        sx, sy = (14, -70) if pose == "run" else (6, -72)
+
+        def A(ph, pivot):
+            return {"type": "swing", "amp": amp, "speed": sp, "phase": ph, "pivot": list(pivot)} if amp else None
+
+        def leg(ph):
+            an = A(ph, (0, 0))
+            _limb(P, [[0, 0], [0, 96]], pants, 14, an)
+            f = {"shape": "ellipse", "cx": 10, "cy": 100, "rx": 19, "ry": 9, "fill": boots}
+            if an:
+                f["anim"] = dict(an)
+            P.append(f)
+
+        def arm(ph):
+            an = A(ph, (sx, sy + 6))
+            pts = ([[sx, sy + 6], [sx + 20, sy + 36], [sx + 48, sy + 22]] if pose == "run"
+                   else [[sx, sy + 6], [sx + 2, sy + 40], [sx + 4, sy + 72]])
+            _limb(P, pts, shirt, 12, an)
+            h = {"shape": "circle", "cx": pts[-1][0], "cy": pts[-1][1], "r": 9, "fill": skin}
+            if an:
+                h["anim"] = dict(an)
+            P.append(h)
+
+        if cape:
+            P.append({"shape": "polygon", "points": ([[sx - 4, sy - 4], [-70, sy + 40], [-92, 30], [-64, 72], [-6, 46], [10, -30]] if pose == "run"
+                                 else [[sx - 4, sy - 4], [-18, sy + 8], [-34, 40], [-24, 84], [8, 72], [10, -30]]),
+                      "fill": cape, "anim": {"type": "swing", "amp": 6, "speed": max(sp, 0.8), "phase": 0, "pivot": [sx, sy]}})
+        arm(math.pi)
+        leg(math.pi)
+        _limb(P, [[0, 0], [sx, sy]], shirt, 38)
+        P.append({"shape": "circle", "cx": 0, "cy": 2, "r": 21, "fill": pants})
+        if emblem:
+            cx, cy = sx * 0.55, sy * 0.55
+            P.append({"shape": "polygon", "points": [[cx, cy - 13], [cx + 12, cy], [cx, cy + 13], [cx - 12, cy]],
+                      "fill": emblem, "ow": 2.5})
+        leg(0)
+        arm(0)
+        _face(P, sx + 12, sy - 36, skin, hair)
+    else:
+        if cape:
+            P.append({"shape": "polygon", "points": [[28, -18], [-30, -36], [-120, -48], [-100, -14], [-140, 14], [-70, 28], [28, 18]],
+                      "fill": cape, "anim": {"type": "swing", "amp": 6, "speed": 4, "phase": 0, "pivot": [28, 0]}})
+        _limb(P, [[22, 8], [-6, 24], [-36, 20]], shirt, 13)
+        P.append({"shape": "circle", "cx": -38, "cy": 20, "r": 9, "fill": skin})
+        for ph, dy in ((math.pi, 6), (0, -2)):
+            an = {"type": "swing", "amp": 7, "speed": 5, "phase": ph, "pivot": [-50, dy]}
+            _limb(P, [[-50, dy], [-110, dy + 10], [-160, dy + 6]], pants, 15, an)
+            P.append({"shape": "ellipse", "cx": -166, "cy": dy + 6, "rx": 18, "ry": 9, "fill": boots, "anim": dict(an)})
+        _limb(P, [[-50, 0], [30, 0]], shirt, 38)
+        P.append({"shape": "circle", "cx": -50, "cy": 0, "r": 21, "fill": pants})
+        if emblem:
+            P.append({"shape": "polygon", "points": [[4, -13], [16, -1], [4, 11], [-8, -1]], "fill": emblem, "ow": 2.5})
+        _limb(P, [[26, -6], [80, -12], [128, -10]], shirt, 13)
+        P.append({"shape": "circle", "cx": 134, "cy": -10, "r": 10, "fill": skin})
+        _face(P, 62, -12, skin, hair)
+    return P
+
+
+STAMPS = {"person": stamp_person}
+
+
 def clean_part(p):
     if not isinstance(p, dict):
         return None
@@ -823,15 +934,18 @@ def clean_spec(raw):
     for a in (acts if isinstance(acts, list) else [])[:30]:
         if not isinstance(a, dict):
             continue
-        parts = [q for q in (clean_part(p) for p in (a.get("parts") if isinstance(a.get("parts"), list) else [])[:40]) if q]
+        st = a.get("stamp") if a.get("stamp") in STAMPS else None
+        raw_parts = (STAMPS[st](a) if st else []) + (a.get("parts") if isinstance(a.get("parts"), list) else [])[:40]
+        parts = [q for q in (clean_part(p) for p in raw_parts[:90]) if q]
         if not parts:
             continue
+        on_ground = bool(st and a.get("pose", "stand") != "fly" and a.get("on_ground", True) is not False)
         m = a.get("motion") if isinstance(a.get("motion"), dict) else {}
         x, y = _num(a.get("x"), -1, 2, 0.5), _num(a.get("y"), -1, 2, 0.5)
         wps = [(_num(px, -1, 2), _num(py, -1, 2)) for px, py in _pts(m.get("waypoints"), 12, 5)] or [(x, y)]
         spec["actors"].append(dict(waypoints=wps, loop=_num(m.get("loop"), 1, 30, 6), face=bool(m.get("face")),
                                    bob=_num(m.get("bob"), 0, 0.1, 0), bob_speed=_num(m.get("bob_speed"), 0, 10, 2),
-                                   scale=_num(a.get("scale"), 0.1, 5, 1), parts=parts))
+                                   scale=_num(a.get("scale"), 0.1, 5, 1), parts=parts, on_ground=on_ground, feet=106))
     return spec if spec["actors"] else None
 
 
