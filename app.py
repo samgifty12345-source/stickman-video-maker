@@ -49,7 +49,7 @@ from PIL import Image
 KREA = "https://api.krea.ai"
 KREA_KEY = os.environ.get("KREA_API_KEY", "")
 ENDPOINT = os.environ.get("SEEDANCE_ENDPOINT", "/generate/video/bytedance/seedance-2")
-MODEL_ID = os.environ.get("SEEDANCE_MODEL", "video/bytedance/seedance-2")
+MODEL_ID = os.environ.get("SEEDANCE_MODEL", "bytedance/seedance-2-mini")   # cheapest. Others: bytedance/seedance-2-fast, bytedance/seedance-2
 FORCED_TOOL = os.environ.get("SEEDANCE_TOOL", "").strip()
 MCP_URL = "https://api.krea.ai/mcp"
 TOKEN_FILE = os.environ.get("TOKEN_FILE", os.path.join(tempfile.gettempdir(), "krea_oauth.json"))
@@ -378,7 +378,7 @@ def resolve_model(m):
     if "id" in _MODEL_CACHE:
         return _MODEL_CACHE["id"]
     chosen = MODEL_ID
-    if not os.environ.get("SEEDANCE_MODEL"):
+    if True:
         try:
             lp = (m.tool("list_models").get("inputSchema") or {}).get("properties", {})
             raw = None
@@ -398,7 +398,7 @@ def resolve_model(m):
                 full = [f for f in found if "/" in f] or found
                 good = [f for f in full if not re.search(r"fast|mini|lite|pro-fast", f, re.I)]
                 pick = [f for f in good if re.search(r"seedance-?2", f, re.I)] or good or full
-                chosen = pick[0]
+                chosen = MODEL_ID if MODEL_ID in found else pick[0]
         except Exception as e:  # noqa
             log(f"[remix] could not list models: {e}")
     log(f"[remix] using model id '{chosen}'")
@@ -547,6 +547,8 @@ def nearest_aspect(w, h):
 
 
 def generate_part(job, i, total, video_url, image_urls, prompt, resolution, seconds, aspect):
+    if "mini" in MODEL_ID and resolution not in ("480p", "720p"):
+        resolution = "720p"                              # Mini tops out at 720p
     body = {"prompt": prompt, "reference_videos": [video_url], "reference_images": image_urls[:9],
             "resolution": resolution, "duration": int(max(4, min(15, round(seconds)))), "aspect_ratio": aspect}
     if AUTH["tokens"]:
