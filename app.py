@@ -370,9 +370,54 @@ class Mcp:
                            + ". Set SEEDANCE_TOOL to the right name.")
 
 
+_MODEL_CACHE = {}
+
+
+def resolve_model(m):
+    """Ask Krea's MCP which Seedance model id it really accepts (ids differ from the REST API)."""
+    if "id" in _MODEL_CACHE:
+        return _MODEL_CACHE["id"]
+    chosen = MODEL_ID
+    if not os.environ.get("SEEDANCE_MODEL"):
+        try:
+            lp = (m.tool("list_models").get("inputSchema") or {}).get("properties", {})
+            raw = None
+            for a in ({"category": "video"}, {"type": "video"}, {}):
+                a = {k: v for k, v in a.items() if k in lp}
+                try:
+                    raw = m.call("list_models", a)
+                    break
+                except RuntimeError:
+                    continue
+            txt = json.dumps(raw) if raw is not None else ""
+            found = sorted(set(re.findall(r"[A-Za-z0-9_./\-]*seedance[A-Za-z0-9_./\-]*", txt, re.I)))
+            log(f"[remix] Krea Seedance models: {', '.join(found) or 'none found'}")
+            if not found:
+                log(f"[remix] list_models said: {txt[:1200]}")
+            else:
+                full = [f for f in found if "/" in f] or found
+                good = [f for f in full if not re.search(r"fast|mini|lite|pro-fast", f, re.I)]
+                pick = [f for f in good if re.search(r"seedance-?2", f, re.I)] or good or full
+                chosen = pick[0]
+        except Exception as e:  # noqa
+            log(f"[remix] could not list models: {e}")
+    log(f"[remix] using model id '{chosen}'")
+    try:
+        sp = (m.tool("get_model_schema").get("inputSchema") or {}).get("properties", {})
+        key = next((k for k in ("model", "model_id", "modelId", "id") if k in sp), None)
+        if key:
+            sch = m.call("get_model_schema", {key: chosen})
+            log(f"[remix] model schema: {json.dumps(sch)[:1500]}")
+    except Exception as e:  # noqa
+        log(f"[remix] schema lookup skipped: {e}")
+    _MODEL_CACHE["id"] = chosen
+    return chosen
+
+
 def oauth_generate(job, i, total, body):
     m = Mcp()
     gname = m.pick_generate_tool()
+    model_id = resolve_model(m)
     gen = m.tool(gname)
     props = (gen.get("inputSchema") or {}).get("properties", {})
     if i == 1:
@@ -385,9 +430,9 @@ def oauth_generate(job, i, total, body):
     def args(preflight=False):
         a = {}
         if mk:
-            a[mk] = MODEL_ID
+            a[mk] = model_id
         elif not props:
-            a["model"] = MODEL_ID
+            a["model"] = model_id
         if nest:
             a[nest] = dict(body)
         else:
