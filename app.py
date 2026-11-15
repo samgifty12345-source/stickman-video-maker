@@ -581,38 +581,55 @@ def _post_json(url, headers, body, timeout=20):
         return json.loads(r.read().decode())
 
 
+def _gemini(system, user, temp, timeout, tag):
+    """Try Gemini models in turn, retrying when Google is overloaded. Returns text or raises RuntimeError."""
+    models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]))
+    dead, last = set(), "no model answered"
+    for rnd in (1, 2, 3):
+        for model in models:
+            if model in dead:
+                continue
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            for think in (True, False):
+                body = {"systemInstruction": {"parts": [{"text": system}]},
+                        "contents": [{"parts": [{"text": user}]}],
+                        "generationConfig": {"responseMimeType": "application/json", "temperature": temp}}
+                if think:
+                    body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
+                log(f"[{tag}] sending to Gemini {model} (round {rnd}, thinking={'low' if think else 'default'}, wait up to {timeout}s)")
+                try:
+                    data = _post_json(url, {"x-goog-api-key": GEMINI_KEY}, body, timeout)
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                except urllib.error.HTTPError as e:
+                    detail = e.read().decode(errors="ignore")
+                    msg = re.sub(r"\s+", " ", detail)[:200]
+                    log(f"[{tag}] Gemini {model} answered HTTP {e.code}: {msg}")
+                    last = f"Gemini HTTP {e.code}"
+                    if e.code == 400 and think:
+                        continue
+                    if e.code == 404:
+                        dead.add(model)
+                    elif e.code in (401, 403):
+                        raise RuntimeError(f"Gemini key rejected (HTTP {e.code}): {msg}")
+                    break
+        if rnd < 3:
+            log(f"[{tag}] all Gemini models busy or failing, waiting 4s then trying again")
+            time.sleep(4)
+    raise RuntimeError(f"Gemini overloaded or unavailable ({last})")
+
+
 def llm_json(system, user, temp=0.2, timeout=20, tag="ai"):
-    """Ask Gemini (or Groq) for a JSON object. Returns (dict or None, error text or None). Never raises."""
+    """Ask Gemini (then Groq as backup) for a JSON object. Returns (dict or None, error text or None). Never raises."""
     t0 = time.time()
     try:
+        text, errs = None, []
         if GEMINI_KEY:
-            data = None
-            for model in dict.fromkeys([GEMINI_MODEL, "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]):
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-                for think in (True, False):
-                    body = {"systemInstruction": {"parts": [{"text": system}]},
-                            "contents": [{"parts": [{"text": user}]}],
-                            "generationConfig": {"responseMimeType": "application/json", "temperature": temp}}
-                    if think:
-                        body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
-                    log(f"[{tag}] sending to Gemini {model} (thinking={'low' if think else 'default'}, wait up to {timeout}s)")
-                    try:
-                        data = _post_json(url, {"x-goog-api-key": GEMINI_KEY}, body, timeout)
-                        break
-                    except urllib.error.HTTPError as e:
-                        detail = e.read().decode(errors="ignore")[:300]
-                        log(f"[{tag}] Gemini {model} answered HTTP {e.code}: {detail}")
-                        if e.code == 400 and think:
-                            continue
-                        if e.code == 404:
-                            break
-                        raise
-                if data is not None:
-                    break
-            if data is None:
-                return None, "no Gemini model worked (404)"
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        elif GROQ_KEY:
+            try:
+                text = _gemini(system, user, temp, timeout, tag)
+            except RuntimeError as e:
+                errs.append(str(e))
+                log(f"[{tag}] {e}")
+        if text is None and GROQ_KEY:
             log(f"[{tag}] sending to Groq {GROQ_MODEL} (wait up to {timeout}s)")
             try:
                 data = _post_json("https://api.groq.com/openai/v1/chat/completions",
@@ -621,13 +638,16 @@ def llm_json(system, user, temp=0.2, timeout=20, tag="ai"):
                                    "response_format": {"type": "json_object"},
                                    "messages": [{"role": "system", "content": system},
                                                 {"role": "user", "content": user}]}, timeout)
+                text = data["choices"][0]["message"]["content"]
             except urllib.error.HTTPError as e:
-                log(f"[{tag}] Groq answered HTTP {e.code}: {e.read().decode(errors='ignore')[:300]}")
-                raise
-            text = data["choices"][0]["message"]["content"]
-        else:
-            log(f"[{tag}] no AI key set")
-            return None, None
+                msg = re.sub(r"\s+", " ", e.read().decode(errors="ignore"))[:200]
+                log(f"[{tag}] Groq answered HTTP {e.code}: {msg}")
+                errs.append(f"Groq HTTP {e.code}")
+        if text is None:
+            if not (GEMINI_KEY or GROQ_KEY):
+                log(f"[{tag}] no AI key set")
+                return None, None
+            return None, "; ".join(errs) or "no answer"
         log(f"[{tag}] reply after {time.time() - t0:.1f}s, {len(text)} chars: {text[:160]!r}")
         text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
         i, j = text.find("{"), text.rfind("}")
@@ -947,9 +967,9 @@ def build_cfg(form):
                 return dict(prompt=prompt, spec=spec, seconds=max(3, min(MAX_SECONDS, seconds)),
                             orientation=ori, quality=q, caption=form.get("caption") == "on",
                             note=f"AI drew your idea: {len(spec['actors'])} objects, {n} shapes.", warn=False)
-            pre = f"(AI drawing failed: {err}. Used the built-in stickman.) "
-            log(f"[plan] AI drawing failed ({err}); falling back to the built-in stickman")
-            form = dict(form, _noai="1")
+            log(f"[plan] AI drawing failed: {err}")
+            raise RuntimeError(f"The AI could not draw this: {err}. Click Generate again in a minute, "
+                               "or set Mode to Built-in stickman.")
         else:
             pre = "(No AI key set, used the built-in stickman.) "
             log("[plan] no GEMINI_API_KEY / GROQ_API_KEY set; using the built-in stickman")
