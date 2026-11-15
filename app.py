@@ -585,7 +585,7 @@ def _gemini(system, user, temp, timeout, tag):
     """Try Gemini models in turn, retrying when Google is overloaded. Returns text or raises RuntimeError."""
     models = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]))
     dead, last = set(), "no model answered"
-    for rnd in (1, 2, 3):
+    for rnd in (1, 2):
         for model in models:
             if model in dead:
                 continue
@@ -598,7 +598,7 @@ def _gemini(system, user, temp, timeout, tag):
                     body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
                 log(f"[{tag}] sending to Gemini {model} (round {rnd}, thinking={'low' if think else 'default'}, wait up to {timeout}s)")
                 try:
-                    data = _post_json(url, {"x-goog-api-key": GEMINI_KEY}, body, timeout)
+                    data = _post_json(url, {"x-goog-api-key": GEMINI_KEY}, body, min(timeout, 30))
                     return data["candidates"][0]["content"]["parts"][0]["text"]
                 except urllib.error.HTTPError as e:
                     detail = e.read().decode(errors="ignore")
@@ -612,9 +612,13 @@ def _gemini(system, user, temp, timeout, tag):
                     elif e.code in (401, 403):
                         raise RuntimeError(f"Gemini key rejected (HTTP {e.code}): {msg}")
                     break
-        if rnd < 3:
-            log(f"[{tag}] all Gemini models busy or failing, waiting 4s then trying again")
-            time.sleep(4)
+                except OSError as e:
+                    log(f"[{tag}] Gemini {model} no answer within 30s ({type(e).__name__}); trying the next model")
+                    last = "Gemini timed out"
+                    break
+        if rnd < 2:
+            log(f"[{tag}] all Gemini models busy or failing, waiting 3s then trying again")
+            time.sleep(3)
     raise RuntimeError(f"Gemini overloaded or unavailable ({last})")
 
 
@@ -637,12 +641,15 @@ def llm_json(system, user, temp=0.2, timeout=20, tag="ai"):
                                   {"model": GROQ_MODEL, "temperature": temp, "max_tokens": 6000,
                                    "response_format": {"type": "json_object"},
                                    "messages": [{"role": "system", "content": system},
-                                                {"role": "user", "content": user}]}, timeout)
+                                                {"role": "user", "content": user}]}, min(timeout, 40))
                 text = data["choices"][0]["message"]["content"]
             except urllib.error.HTTPError as e:
                 msg = re.sub(r"\s+", " ", e.read().decode(errors="ignore"))[:200]
                 log(f"[{tag}] Groq answered HTTP {e.code}: {msg}")
                 errs.append(f"Groq HTTP {e.code}")
+            except OSError as e:
+                log(f"[{tag}] Groq no answer ({type(e).__name__})")
+                errs.append("Groq timed out")
         if text is None:
             if not (GEMINI_KEY or GROQ_KEY):
                 log(f"[{tag}] no AI key set")
@@ -694,7 +701,7 @@ SCENE_SYSTEM = (
     "RULES: list actors and parts back to front (later is drawn on top). Build scenery (trees, flowers, houses, "
     "clouds, sun, hills) as extra actors with no motion. Use 4 to 12 actors and 3 to 20 parts each. Give every moving "
     "creature animated limbs/wings/tail and a face with eyes. Keep everything inside the canvas. "
-    "Make waypoints visit the right places in the story.\n"
+    "Make waypoints visit the right places in the story. Keep the whole scene under 60 parts so the reply is short.\n"
     "EXAMPLE (a bee going between two flowers):\n"
     '{"background":{"sky_top":"#6ec3ff","sky_bottom":"#ffe8be","ground":"#70cd5c","ground_y":0.75},"actors":['
     '{"x":0.25,"y":0.75,"scale":1.2,"parts":[{"shape":"line","points":[[0,0],[0,-120]],"width":8,"color":"#2f9a3a"},'
@@ -822,7 +829,7 @@ def ask_scene(prompt, orientation):
     last = None
     for n in (1, 2):
         log(f"[scene] attempt {n}: asking the AI to draw {prompt!r} ({orientation})")
-        raw, err = llm_json(SCENE_SYSTEM, f"Canvas: {orientation}. Idea: {prompt}", 0.5, 90, tag="scene")
+        raw, err = llm_json(SCENE_SYSTEM, f"Canvas: {orientation}. Idea: {prompt}", 0.5, 30, tag="scene")
         if err:
             return None, err
         spec = clean_spec(raw) if raw else None
