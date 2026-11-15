@@ -1,18 +1,20 @@
 """
 Stickman Video Maker - a tiny web app. One file.
 
-Run on your PC:   pip install flask pillow   (ffmpeg must be installed)
+Run on your PC:   pip install flask pillow edge-tts   (ffmpeg must be installed)
                   python app.py     ->  open http://localhost:8080
-Run on Railway:   see the Dockerfile next to this file.
+Run on Railway:   see the Dockerfile next to this file (add edge-tts to its pip line).
 
 Optional environment variables:
   APP_PASSWORD   if set, people must type it to generate a video
   MAX_SECONDS    longest video allowed (default 15)
+  MAX_DUB_SECONDS longest subtitle voiceover allowed (default 180)
   GEMINI_API_KEY free key from aistudio.google.com - lets the page understand any prompt
   GROQ_API_KEY   alternative free key from console.groq.com (used if no Gemini key)
   GEMINI_MODEL / GROQ_MODEL   override the model names if they change
   PORT           web port (Railway sets this itself)
 """
+import asyncio
 import hmac
 import traceback
 from collections import deque
@@ -30,12 +32,14 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 
 from flask import Flask, abort, jsonify, request, send_file
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 FPS = 30
 MAX_SECONDS = int(os.environ.get("MAX_SECONDS", "15"))
+MAX_DUB = int(os.environ.get("MAX_DUB_SECONDS", "180"))
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 JOB_DIR = os.path.join(tempfile.gettempdir(), "stickman_jobs")
 os.makedirs(JOB_DIR, exist_ok=True)
@@ -95,6 +99,24 @@ def load_font(size):
         return ImageFont.load_default(size)
     except TypeError:
         return ImageFont.load_default()
+
+
+def draw_caption(out, cfg, t, font, size):
+    """Draws the subtitle for the current moment (dub mode), or the old top caption."""
+    cues = cfg.get("cues")
+    if cues:
+        text, top = next((c["text"] for c in cues if c["start"] <= t < c["end"]), ""), 0.70
+    else:
+        text, top = (cfg["prompt"] if cfg.get("caption") else ""), 0.04
+    if not text:
+        return
+    W, H = out.size
+    dr = ImageDraw.Draw(out)
+    width = max(12, int(W * 0.9 / (size * 0.62)))
+    y = int(H * top)
+    for ln in textwrap.wrap(text, width)[:5]:
+        dr.text((W / 2, y), ln, font=font, fill=WHITE, stroke_width=4, stroke_fill=BLACK, anchor="mt")
+        y += int(size * 1.2)
 
 
 # ====================================================================== drawing
@@ -419,14 +441,7 @@ class Scene:
             img = self.raw(t)
         out = img.resize((self.W, self.H), Image.LANCZOS)
         out.paste((0, 0, 0), (0, 0), self.vig)
-        if self.cfg["caption"] and self.cfg["prompt"]:
-            dr = ImageDraw.Draw(out)
-            width = max(12, int(self.W * 0.9 / (self.font_size * 0.62)))
-            y = int(self.H * 0.04)
-            for ln in textwrap.wrap(self.cfg["prompt"], width)[:4]:
-                dr.text((self.W / 2, y), ln, font=self.font, fill=WHITE, stroke_width=4,
-                        stroke_fill=BLACK, anchor="mt")
-                y += int(self.font_size * 1.2)
+        draw_caption(out, self.cfg, t, self.font, self.font_size)
         return out
 
 
@@ -518,14 +533,7 @@ class AIScene:
                     for q in (pp[0], pp[-1]):
                         d.ellipse([q[0] - r, q[1] - r, q[0] + r, q[1] + r], fill=p["outline"])
         out = img.resize((self.W, self.H), Image.LANCZOS)
-        if self.cfg["caption"] and self.cfg["prompt"]:
-            dr = ImageDraw.Draw(out)
-            width = max(12, int(self.W * 0.9 / (self.font_size * 0.62)))
-            y = int(self.H * 0.04)
-            for ln in textwrap.wrap(self.cfg["prompt"], width)[:4]:
-                dr.text((self.W / 2, y), ln, font=self.font, fill=WHITE, stroke_width=4,
-                        stroke_fill=BLACK, anchor="mt")
-                y += int(self.font_size * 1.2)
+        draw_caption(out, self.cfg, t, self.font, self.font_size)
         return out
 
 
@@ -553,6 +561,147 @@ def render(cfg, out_path, progress):
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg failed: " + err[-300:])
 
+
+# ================================================================= SUBTITLE VOICEOVER
+VOICES = {"en-US-GuyNeural", "en-US-ChristopherNeural", "en-US-JennyNeural", "en-US-AriaNeural",
+          "en-GB-RyanNeural", "en-GB-SoniaNeural", "en-AU-WilliamNeural"}
+RATES = {"-10%", "+0%", "+15%", "+30%"}
+SRT_TIME = re.compile(r"(\d+):(\d\d):(\d\d)[,.](\d{1,3})\s*-->\s*(\d+):(\d\d):(\d\d)[,.](\d{1,3})")
+
+
+def _secs(h, m, s, ms):
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms.ljust(3, "0")) / 1000
+
+
+def parse_subs(raw):
+    """SRT text -> [{start, end, text}]. Lines without timestamps are timed automatically."""
+    raw = raw.replace("\r", "").strip()
+    cues = []
+    for block in re.split(r"\n\s*\n", raw):
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+        for i, l in enumerate(lines):
+            m = SRT_TIME.search(l)
+            if m:
+                g = m.groups()
+                text = re.sub(r"<[^>]+>|\{[^}]*\}", "", " ".join(lines[i + 1:])).strip()
+                if text:
+                    cues.append(dict(start=_secs(*g[:4]), end=_secs(*g[4:]), text=text))
+                break
+    if cues:
+        return cues
+    t = 0.0                                   # no timestamps: one cue per line, timed by length
+    for l in raw.split("\n"):
+        l = l.strip()
+        if l:
+            d = max(1.5, len(l.split()) / 2.6)
+            cues.append(dict(start=t, end=t + d, text=l))
+            t += d + 0.25
+    return cues
+
+
+async def _speak(text, voice, rate, path):
+    import edge_tts
+    await edge_tts.Communicate(text, voice, rate=rate).save(path)
+
+
+def tts(text, voice, rate, path):
+    for n in range(3):
+        try:
+            asyncio.run(_speak(text, voice, rate, path))
+            if os.path.getsize(path) > 500:
+                return
+        except Exception as e:  # noqa
+            log(f"[voice] try {n + 1} failed: {type(e).__name__}: {e}")
+            time.sleep(1.5)
+    raise RuntimeError("The voice service did not answer. Try again in a minute.")
+
+
+def audio_len(p):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p],
+                       capture_output=True, text=True)
+    return float(r.stdout.strip() or 0)
+
+
+def ff(*args):
+    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *args], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("ffmpeg: " + r.stderr[-200:])
+
+
+def srt_time(x):
+    return time.strftime("%H:%M:%S", time.gmtime(x)) + f",{int(x % 1 * 1000):03d}"
+
+
+def dub_worker(jid, form):
+    job = JOBS[jid]
+    wd = os.path.join(JOB_DIR, jid)
+    try:
+        job["status"] = "thinking"
+        cues = parse_subs(form["subs"])
+        if not cues:
+            raise RuntimeError("I could not find any subtitle text.")
+        if len(cues) > 150:
+            raise RuntimeError("Too many subtitles (max 150 at once).")
+        voice = form.get("voice") if form.get("voice") in VOICES else "en-US-GuyNeural"
+        rate = form.get("vrate") if form.get("vrate") in RATES else "+0%"
+        os.makedirs(wd, exist_ok=True)
+        pieces, timeline, cursor, srt = [], [], 0.0, []
+        for n, c in enumerate(cues, 1):
+            job["progress"] = n / len(cues)
+            job["note"] = f"Making voice {n} of {len(cues)}..."
+            raw, clip = os.path.join(wd, f"raw{n}.mp3"), os.path.join(wd, f"clip_{n:03d}.wav")
+            tts(c["text"], voice, rate, raw)
+            d = audio_len(raw)
+            slot = max(0.5, c["end"] - c["start"])
+            f = min(2.0, max(1.0, d / slot))            # speed up (max 2x) when the line is too long for its slot
+            ff("-i", raw, "-af", (f"atempo={f:.4f}," if f > 1.01 else "") + "aresample=44100", "-ac", "1", clip)
+            length = audio_len(clip)
+            start = max(c["start"], cursor)             # if a line overruns, the next one waits for it
+            if start - cursor > 0.02:
+                sil = os.path.join(wd, f"gap{n}.wav")
+                ff("-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", f"{start - cursor:.3f}", sil)
+                pieces.append(sil)
+            pieces.append(clip)
+            cursor = start + length
+            timeline.append(dict(start=start, end=cursor, text=c["text"]))
+            srt.append(f"{n}\n{srt_time(start)} --> {srt_time(cursor)}\n{c['text']}\n")
+            log(f"[dub {jid}] {n}/{len(cues)} start {start:.1f}s length {length:.1f}s speedup x{f:.2f}")
+        if cursor > MAX_DUB:
+            raise RuntimeError(f"The voiceover is {cursor:.0f}s long; the limit is {MAX_DUB}s (MAX_DUB_SECONDS).")
+        lst = os.path.join(wd, "list.txt")
+        with open(lst, "w") as fh:
+            fh.write("".join(f"file '{p}'\n" for p in pieces))
+        full = os.path.join(wd, "full.wav")
+        ff("-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", full)
+        ff("-i", full, "-b:a", "128k", os.path.join(JOB_DIR, jid + ".mp3"))
+        with open(os.path.join(wd, "subtitles_fixed.srt"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(srt))
+        with zipfile.ZipFile(os.path.join(JOB_DIR, jid + ".zip"), "w", zipfile.ZIP_DEFLATED) as z:
+            for n in range(1, len(cues) + 1):
+                z.write(os.path.join(wd, f"clip_{n:03d}.wav"), f"clip_{n:03d}.wav")
+            z.write(os.path.join(wd, "subtitles_fixed.srt"), "subtitles_fixed.srt")
+        job.update(audio=True, note=f"Voiceover ready: {len(cues)} lines, {cursor:.1f}s.", warn=False)
+        if form.get("makevideo") != "on":
+            job.update(status="done", progress=1.0)
+            return
+        cfg = build_cfg(form)                           # same AI/built-in scene as before
+        cfg.update(seconds=cursor + 0.6, cues=timeline, caption=True)
+    except Exception as e:  # noqa
+        log(f"[dub {jid}] FAILED: {traceback.format_exc()[-600:]}")
+        job.update(status="error", error=str(e))
+        return
+    with RENDER_LOCK:
+        job["status"] = "rendering"
+        try:
+            silent = os.path.join(wd, "silent.mp4")
+            render(cfg, silent, lambda p: job.update(progress=p))
+            ff("-i", silent, "-i", full, "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest",
+               "-movflags", "+faststart", os.path.join(JOB_DIR, jid + ".mp4"))
+            job.update(status="done", progress=1.0, video=True)
+            log(f"[dub {jid}] DONE, video + voice ready")
+        except Exception as e:  # noqa
+            log(f"[dub {jid}] FAILED while rendering: {traceback.format_exc()[-600:]}")
+            job.update(status="error", error=str(e))
 
 
 # ================================================================= AI brain (optional)
@@ -1149,14 +1298,20 @@ def cleanup():
     for jid in list(JOBS):
         if now - JOBS[jid]["created"] > 3600:
             JOBS.pop(jid, None)
-            try:
-                os.remove(os.path.join(JOB_DIR, jid + ".mp4"))
-            except OSError:
-                pass
+            for ext in (".mp4", ".mp3", ".zip"):
+                try:
+                    os.remove(os.path.join(JOB_DIR, jid + ext))
+                except OSError:
+                    pass
+            shutil.rmtree(os.path.join(JOB_DIR, jid), ignore_errors=True)
 
 
 def worker(jid, form):
     job = JOBS[jid]
+    if (form.get("subs") or "").strip():          # subtitles pasted -> voiceover (and optional video)
+        log(f"[job {jid}] subtitle voiceover started, voice={form.get('voice')}, rate={form.get('vrate')}, "
+            f"video={'yes' if form.get('makevideo') == 'on' else 'no'}")
+        return dub_worker(jid, form)
     try:
         job["status"] = "thinking"
         log(f"[job {jid}] started: {form.get('prompt')!r}, mode={form.get('mode', 'ai')}, "
@@ -1226,7 +1381,8 @@ def status(jid):
     if not job:
         abort(404)
     return jsonify(status=job["status"], progress=job["progress"], error=job.get("error"),
-                   note=job.get("note", ""), warn=job.get("warn", False))
+                   note=job.get("note", ""), warn=job.get("warn", False),
+                   audio=job.get("audio", False), video=job.get("video", job.get("audio") is None))
 
 
 @app.get("/video/<jid>")
@@ -1236,6 +1392,22 @@ def video(jid):
     if not job or job["status"] != "done" or not os.path.exists(path):
         abort(404)
     return send_file(path, mimetype="video/mp4", conditional=True)
+
+
+@app.get("/audio/<jid>")
+def audio(jid):
+    path = os.path.join(JOB_DIR, jid + ".mp3")
+    if jid not in JOBS or not os.path.exists(path):
+        abort(404)
+    return send_file(path, mimetype="audio/mpeg", conditional=True)
+
+
+@app.get("/clips/<jid>")
+def clips(jid):
+    path = os.path.join(JOB_DIR, jid + ".zip")
+    if jid not in JOBS or not os.path.exists(path):
+        abort(404)
+    return send_file(path, mimetype="application/zip", as_attachment=True, download_name="voice_clips.zip")
 
 
 @app.get("/health")
@@ -1279,6 +1451,13 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <label>Quality</label>
  <select name="quality"><option value="draft">Draft (fastest)</option><option value="normal" selected>Normal</option><option value="high">High (smoother, slower)</option></select>
  <div class="chk"><input type="checkbox" name="caption" id="cap"><label for="cap" style="margin:0">Show my text as a caption on the video</label></div>
+ <label>Subtitles to voice (optional: paste SRT, or one sentence per line). When filled, the video length follows the voice.</label>
+ <textarea name="subs" rows="6" placeholder="1&#10;00:00:00,000 --> 00:00:03,000&#10;Hello everyone&#10;&#10;2&#10;00:00:03,500 --> 00:00:06,000&#10;Welcome to my channel"></textarea>
+ <div class="row">
+  <div><label>Voice</label><select name="voice"><option value="en-US-GuyNeural">Guy (US man)</option><option value="en-US-ChristopherNeural">Christopher (US man, deep)</option><option value="en-US-JennyNeural">Jenny (US woman)</option><option value="en-US-AriaNeural">Aria (US woman)</option><option value="en-GB-RyanNeural">Ryan (UK man)</option><option value="en-GB-SoniaNeural">Sonia (UK woman)</option><option value="en-AU-WilliamNeural">William (AU man)</option></select></div>
+  <div><label>Voice speed</label><select name="vrate"><option value="-10%">Slower</option><option value="+0%" selected>Normal</option><option value="+15%">Faster</option><option value="+30%">Very fast</option></select></div>
+ </div>
+ <div class="chk"><input type="checkbox" name="makevideo" id="mv" checked><label for="mv" style="margin:0">Also make the video (my idea above) with this voice and subtitles</label></div>
  __PW__
  <button id="go">Generate video</button>
 </form>
@@ -1301,13 +1480,14 @@ async function poll(id){
   const r=await fetch('/status/'+id); if(!r.ok){throw new Error('lost');} const j=await r.json();
   if(j.note){note.textContent=j.note; note.className=j.warn?'warn':'';}
   if(j.status==='done'){
-   fill.style.width='100%'; msg.textContent='Done!';
-   out.innerHTML='<video src="/video/'+id+'" controls autoplay loop playsinline></video><a class="dl" href="/video/'+id+'" download="stickman.mp4">Download MP4</a>';
-   go.disabled=false; return;
+   fill.style.width='100%'; msg.textContent='Done!'; let h='';
+   if(j.video) h+='<video src="/video/'+id+'" controls autoplay loop playsinline></video><a class="dl" href="/video/'+id+'" download="stickman.mp4">Download MP4</a><br>';
+   if(j.audio) h+='<audio src="/audio/'+id+'" controls style="width:100%;margin-top:10px"></audio><a class="dl" href="/audio/'+id+'" download="voiceover.mp3">Download voiceover MP3</a> &nbsp; <a class="dl" href="/clips/'+id+'">Download separate clips + fixed SRT (ZIP)</a>';
+   out.innerHTML=h; go.disabled=false; return;
   }
   if(j.status==='error'){msg.textContent='Error: '+j.error; go.disabled=false; return;}
   fill.style.width=Math.max(3,Math.round(j.progress*100))+'%';
-  msg.textContent=j.status==='queued'?'Waiting in line...':j.status==='thinking'?'Asking the AI to draw it...':'Drawing frames... '+Math.round(j.progress*100)+'%';
+  msg.textContent=j.status==='queued'?'Waiting in line...':j.status==='thinking'?'Asking the AI / making the voice...':'Drawing frames... '+Math.round(j.progress*100)+'%';
   setTimeout(()=>poll(id),1000);
  }catch(err){msg.textContent='Lost connection to the job. Try again.'; go.disabled=false;}
 }
