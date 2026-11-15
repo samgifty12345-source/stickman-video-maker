@@ -414,6 +414,20 @@ def resolve_model(m):
     return chosen
 
 
+def get_bal(m, show_raw=False):
+    """Current Krea balance (credits / compute units) or None if it can't be read."""
+    try:
+        raw = m.call("get_balance", {})
+        if show_raw:
+            log(f"[remix] balance reply: {json.dumps(raw)[:400]}")
+        v = find_key(raw, ("available_compute_units", "compute_units", "credits", "balance", "available"))
+        return float(v) if isinstance(v, (int, float, str)) and str(v).replace(".", "", 1).isdigit() else None
+    except Exception as e:  # noqa
+        if show_raw:
+            log(f"[remix] could not read balance: {e}")
+        return None
+
+
 def oauth_generate(job, i, total, body):
     m = Mcp()
     gname = m.pick_generate_tool()
@@ -458,6 +472,7 @@ def oauth_generate(job, i, total, body):
         dropped = [k for k in body if props and not nest and k not in props]
         if dropped:
             log(f"[remix] WARNING: this Krea tool has no field for: {', '.join(dropped)} (not sent)")
+    bal0 = get_bal(m, show_raw=(i == 1))
     data = m.call(gname, args())
     url = find_video_url(data)
     jid = find_key(data, ("job_id", "jobId", "id"))
@@ -488,10 +503,19 @@ def oauth_generate(job, i, total, body):
             if not u:
                 raise RuntimeError(f"Krea finished but I found no video URL: {str(j)[:250]}")
             log(f"[remix] part {i}/{total}: done in {int(time.time() - t0)}s")
+            bal1 = get_bal(m)
+            if bal0 is not None and bal1 is not None:
+                cost = bal0 - bal1
+                log(f"[remix] COST of part {i}: about {cost:.0f} credits (balance {bal0:.0f} -> {bal1:.0f}); "
+                    f"the whole video would be about {cost * total_parts(job):.0f}")
             return u
         if st in ("failed", "cancelled"):
             raise RuntimeError(f"Krea job {st}: {str(find_key(j, ('error', 'message')) or j)[:250]}")
     raise RuntimeError("Krea took longer than 20 minutes for one part.")
+
+
+def total_parts(job):
+    return job.get("all_parts", 1)
 
 
 def krea_call(path, body=None, timeout=60):
@@ -582,6 +606,7 @@ def worker(jid, base, opts):
                 n_run = 1
             else:
                 n_run = n
+            job["all_parts"] = n
             log(f"[remix {jid}] {dur:.1f}s video -> {n} part(s) of {length:.1f}s, running {n_run}")
             image_urls = [f"{base}/files/{jid}/{f}" for f in sorted(os.listdir(wd)) if f.startswith("ref_")]
             outs = []
