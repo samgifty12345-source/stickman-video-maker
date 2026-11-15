@@ -14,6 +14,8 @@ Optional environment variables:
   PORT           web port (Railway sets this itself)
 """
 import hmac
+import traceback
+from collections import deque
 import json
 import math
 import os
@@ -37,6 +39,19 @@ MAX_SECONDS = int(os.environ.get("MAX_SECONDS", "15"))
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 JOB_DIR = os.path.join(tempfile.gettempdir(), "stickman_jobs")
 os.makedirs(JOB_DIR, exist_ok=True)
+
+LOGS = deque(maxlen=1500)           # shown live in the side panel of the page
+LOG_LOCK = threading.Lock()
+LOG_N = [0]
+
+
+def log(msg):
+    with LOG_LOCK:
+        LOG_N[0] += 1
+        line = time.strftime("%H:%M:%S ", time.gmtime()) + str(msg)
+        LOGS.append((LOG_N[0], line))
+    print(line, flush=True)
+
 
 BLACK = (20, 20, 20)
 WHITE = (255, 255, 255)
@@ -566,36 +581,54 @@ def _post_json(url, headers, body, timeout=20):
         return json.loads(r.read().decode())
 
 
-def llm_json(system, user, temp=0.2, timeout=20):
+def llm_json(system, user, temp=0.2, timeout=20, tag="ai"):
     """Ask Gemini (or Groq) for a JSON object. Returns (dict or None, error text or None). Never raises."""
+    t0 = time.time()
     try:
         if GEMINI_KEY:
             data = None
             for model in dict.fromkeys([GEMINI_MODEL, "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]):
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-                try:
-                    data = _post_json(url, {"x-goog-api-key": GEMINI_KEY}, {
-                        "systemInstruction": {"parts": [{"text": system}]},
-                        "contents": [{"parts": [{"text": user}]}],
-                        "generationConfig": {"responseMimeType": "application/json", "temperature": temp}}, timeout)
-                    break
-                except urllib.error.HTTPError as e:
-                    print(f"[ai] gemini model {model} failed: HTTP {e.code}", flush=True)
-                    if e.code != 404:
+                for think in (True, False):
+                    body = {"systemInstruction": {"parts": [{"text": system}]},
+                            "contents": [{"parts": [{"text": user}]}],
+                            "generationConfig": {"responseMimeType": "application/json", "temperature": temp}}
+                    if think:
+                        body["generationConfig"]["thinkingConfig"] = {"thinkingLevel": "low"}
+                    log(f"[{tag}] sending to Gemini {model} (thinking={'low' if think else 'default'}, wait up to {timeout}s)")
+                    try:
+                        data = _post_json(url, {"x-goog-api-key": GEMINI_KEY}, body, timeout)
+                        break
+                    except urllib.error.HTTPError as e:
+                        detail = e.read().decode(errors="ignore")[:300]
+                        log(f"[{tag}] Gemini {model} answered HTTP {e.code}: {detail}")
+                        if e.code == 400 and think:
+                            continue
+                        if e.code == 404:
+                            break
                         raise
+                if data is not None:
+                    break
             if data is None:
                 return None, "no Gemini model worked (404)"
             text = data["candidates"][0]["content"]["parts"][0]["text"]
         elif GROQ_KEY:
-            data = _post_json("https://api.groq.com/openai/v1/chat/completions",
-                              {"Authorization": "Bearer " + GROQ_KEY},
-                              {"model": GROQ_MODEL, "temperature": temp, "max_tokens": 6000,
-                               "response_format": {"type": "json_object"},
-                               "messages": [{"role": "system", "content": system},
-                                            {"role": "user", "content": user}]}, timeout)
+            log(f"[{tag}] sending to Groq {GROQ_MODEL} (wait up to {timeout}s)")
+            try:
+                data = _post_json("https://api.groq.com/openai/v1/chat/completions",
+                                  {"Authorization": "Bearer " + GROQ_KEY},
+                                  {"model": GROQ_MODEL, "temperature": temp, "max_tokens": 6000,
+                                   "response_format": {"type": "json_object"},
+                                   "messages": [{"role": "system", "content": system},
+                                                {"role": "user", "content": user}]}, timeout)
+            except urllib.error.HTTPError as e:
+                log(f"[{tag}] Groq answered HTTP {e.code}: {e.read().decode(errors='ignore')[:300]}")
+                raise
             text = data["choices"][0]["message"]["content"]
         else:
+            log(f"[{tag}] no AI key set")
             return None, None
+        log(f"[{tag}] reply after {time.time() - t0:.1f}s, {len(text)} chars: {text[:160]!r}")
         text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
         i, j = text.find("{"), text.rfind("}")
         if i >= 0 and j > i:
@@ -603,8 +636,8 @@ def llm_json(system, user, temp=0.2, timeout=20):
         out = json.loads(text)
         return (out if isinstance(out, dict) else None), None
     except Exception as e:  # noqa
-        print(f"[ai] error: {e}", flush=True)
-        return None, str(e)[:120]
+        log(f"[{tag}] ERROR after {time.time() - t0:.1f}s: {type(e).__name__}: {e}")
+        return None, f"{type(e).__name__}: {e}"[:140]
 
 
 def ask_ai(prompt):
@@ -767,12 +800,18 @@ def clean_spec(raw):
 
 def ask_scene(prompt, orientation):
     last = None
-    for _ in range(2):
-        raw, err = llm_json(SCENE_SYSTEM, f"Canvas: {orientation}. Idea: {prompt}", 0.5, 60)
+    for n in (1, 2):
+        log(f"[scene] attempt {n}: asking the AI to draw {prompt!r} ({orientation})")
+        raw, err = llm_json(SCENE_SYSTEM, f"Canvas: {orientation}. Idea: {prompt}", 0.5, 90, tag="scene")
+        if err:
+            return None, err
         spec = clean_spec(raw) if raw else None
         if spec:
+            n_parts = sum(len(a["parts"]) for a in spec["actors"])
+            log(f"[scene] checked the drawing: {len(spec['actors'])} objects, {n_parts} shapes, OK")
             return spec, None
-        last = err or "the AI reply had no usable drawing"
+        last = "the AI reply had no usable drawing"
+        log(f"[scene] {last}; keys in reply: {list(raw)[:8] if raw else None}")
     return None, last
 
 
@@ -783,7 +822,7 @@ def build_cfg_builtin(form):
     hits = []
     keys = ("chaser", "scene", "shirt", "speed", "action", "cape")
     all_auto = all((form.get(k) or "auto") == "auto" for k in keys)
-    ai, ai_err = (ask_ai(prompt) if prompt and not all(
+    ai, ai_err = (ask_ai(prompt) if prompt and not form.get("_noai") and not all(
         (form.get(k) or "auto") != "auto" for k in keys) else (None, None))
 
     def ai_pick(key, allowed):
@@ -880,7 +919,7 @@ def build_cfg_builtin(form):
     if ai_err:
         note = f"(AI unavailable: {ai_err}. Used keyword matching.) " + note
         warn = True
-    print(f"[build_cfg] prompt={prompt!r} ai={'yes' if ai else 'no'} err={ai_err} -> {desc}", flush=True)
+    log(f"[builtin] settings: {desc} (AI used: {'yes' if ai else 'no'}{', err: ' + str(ai_err) if ai_err else ''})")
     return dict(prompt=prompt, chaser=chaser, scene=scene, shirt=shirt, action=action, cape=cape_on,
                 speed={"slow": 0.7, "normal": 1.0, "fast": 1.3}[sp],
                 seconds=max(3, min(MAX_SECONDS, seconds)),
@@ -894,6 +933,7 @@ def build_cfg(form):
     pre = ""
     if (form.get("mode") or "ai") == "ai" and prompt:
         if GEMINI_KEY or GROQ_KEY:
+            log(f"[plan] mode=AI draws it, provider={'Gemini ' + GEMINI_MODEL if GEMINI_KEY else 'Groq ' + GROQ_MODEL}")
             ori = form.get("orientation") if form.get("orientation") in SIZES else "vertical"
             spec, err = ask_scene(prompt, ori)
             if spec:
@@ -903,13 +943,18 @@ def build_cfg(form):
                     seconds = 8
                 q = form.get("quality") if form.get("quality") in ("draft", "normal", "high") else "normal"
                 n = sum(len(a["parts"]) for a in spec["actors"])
-                print(f"[build_cfg] AI-drawn scene: {len(spec['actors'])} objects, {n} shapes", flush=True)
+                log(f"[plan] using the AI drawing: {len(spec['actors'])} objects, {n} shapes, {seconds}s, {ori}, {q}")
                 return dict(prompt=prompt, spec=spec, seconds=max(3, min(MAX_SECONDS, seconds)),
                             orientation=ori, quality=q, caption=form.get("caption") == "on",
                             note=f"AI drew your idea: {len(spec['actors'])} objects, {n} shapes.", warn=False)
             pre = f"(AI drawing failed: {err}. Used the built-in stickman.) "
+            log(f"[plan] AI drawing failed ({err}); falling back to the built-in stickman")
+            form = dict(form, _noai="1")
         else:
             pre = "(No AI key set, used the built-in stickman.) "
+            log("[plan] no GEMINI_API_KEY / GROQ_API_KEY set; using the built-in stickman")
+    else:
+        log("[plan] mode=built-in stickman")
     cfg = build_cfg_builtin(form)
     if pre:
         cfg["note"], cfg["warn"] = pre + cfg["note"], True
@@ -937,17 +982,34 @@ def worker(jid, form):
     job = JOBS[jid]
     try:
         job["status"] = "thinking"
+        log(f"[job {jid}] started: {form.get('prompt')!r}, mode={form.get('mode', 'ai')}, "
+            f"{form.get('orientation')}, {form.get('seconds')}s, quality={form.get('quality')}")
         cfg = build_cfg(form)
         job.update(note=cfg["note"], warn=cfg["warn"])
+        log(f"[job {jid}] plan ready: {cfg['note']}")
     except Exception as e:  # noqa
+        log(f"[job {jid}] FAILED while planning: {traceback.format_exc()[-600:]}")
         job.update(status="error", error=str(e))
         return
+    log(f"[job {jid}] waiting for the renderer")
     with RENDER_LOCK:
         job["status"] = "rendering"
+        last = [-1]
+
+        def prog(p):
+            job.update(progress=p)
+            q = int(p * 4)
+            if q != last[0]:
+                last[0] = q
+                log(f"[job {jid}] drawing frames {int(p * 100)}%")
         try:
-            render(cfg, os.path.join(JOB_DIR, jid + ".mp4"), lambda p: job.update(progress=p))
+            t0 = time.time()
+            log(f"[job {jid}] render start ({int(FPS * cfg['seconds'])} frames, ffmpeg)")
+            render(cfg, os.path.join(JOB_DIR, jid + ".mp4"), prog)
             job.update(status="done", progress=1.0)
+            log(f"[job {jid}] DONE in {time.time() - t0:.1f}s, video ready")
         except Exception as e:  # noqa
+            log(f"[job {jid}] FAILED while rendering: {traceback.format_exc()[-600:]}")
             job.update(status="error", error=str(e))
 
 
@@ -962,6 +1024,14 @@ def generate():
     JOBS[jid] = dict(status="queued", progress=0.0, created=time.time(), note="", warn=False)
     threading.Thread(target=worker, args=(jid, request.form.to_dict()), daemon=True).start()
     return jsonify(id=jid)
+
+
+@app.get("/logs")
+def logs():
+    since = request.args.get("since", 0, type=int)
+    with LOG_LOCK:
+        items = list(LOGS)
+    return jsonify(lines=[x for x in items if x[0] > since])
 
 
 @app.get("/status/<jid>")
@@ -991,7 +1061,10 @@ def health():
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Stickman Video Maker</title>
 <style>
- body{font-family:system-ui,sans-serif;background:#0f1220;color:#eef;max-width:620px;margin:0 auto;padding:16px}
+ body{font-family:system-ui,sans-serif;background:#0f1220;color:#eef;max-width:1200px;margin:0 auto;padding:16px}
+ #wrap{display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start} #main{flex:1 1 440px;max-width:620px;min-width:0} #side{flex:1 1 360px;min-width:0;position:sticky;top:10px}
+ #side h2{font-size:1rem;margin:4px 0 8px;display:flex;justify-content:space-between} #side button{margin:0;width:auto;padding:4px 10px;font-size:.8rem;background:#334}
+ #log{background:#080a14;border:1px solid #334;border-radius:8px;height:80vh;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;padding:8px;white-space:pre-wrap;word-break:break-word;color:#b8c4e0} #log .err{color:#ff8a8a} #log .ok{color:#7be0a0}
  h1{font-size:1.5rem} label{display:block;margin:12px 0 4px;font-size:.9rem;color:#aab}
  input,select,textarea{width:100%;padding:10px;border-radius:8px;border:1px solid #334;background:#181d33;color:#fff;font-size:1rem;box-sizing:border-box}
  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
@@ -1000,6 +1073,7 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  .bar div{height:100%;width:0;background:#4ad98a} #msg{margin-top:10px;color:#cdd} #note{margin-top:14px;color:#8fe0b0} #note.warn{color:#ffd479} video{width:100%;margin-top:14px;border-radius:10px;background:#000}
  a.dl{display:inline-block;margin-top:10px;color:#8fd3ff} .chk{display:flex;gap:8px;align-items:center;margin-top:14px} .chk input{width:auto}
 </style></head><body>
+<div id="wrap"><div id="main">
 <h1>Stickman Video Maker</h1>
 <form id="f">
  <label>What do you want to see?</label>
@@ -1022,6 +1096,8 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <button id="go">Generate video</button>
 </form>
 <div id="note"></div><div class="bar" id="bar"><div id="fill"></div></div><div id="msg"></div><div id="out"></div>
+</div>
+<div id="side"><h2><span>Live log</span><button type="button" id="clr">Clear view</button></h2><div id="log">Waiting for activity...</div></div></div>
 <script>
 const f=document.getElementById('f'),go=document.getElementById('go'),bar=document.getElementById('bar'),
 fill=document.getElementById('fill'),msg=document.getElementById('msg'),note=document.getElementById('note'),out=document.getElementById('out');
@@ -1048,6 +1124,22 @@ async function poll(id){
   setTimeout(()=>poll(id),1000);
  }catch(err){msg.textContent='Lost connection to the job. Try again.'; go.disabled=false;}
 }
+let lastLog=0; const logEl=document.getElementById('log');
+document.getElementById('clr').onclick=()=>{logEl.innerHTML='';};
+async function pollLogs(){
+ try{
+  const r=await fetch('/logs?since='+lastLog); const j=await r.json();
+  if(j.lines.length&&lastLog===0) logEl.innerHTML='';
+  for(const [n,l] of j.lines){
+   const d=document.createElement('div'); d.textContent=l;
+   if(/error|failed|traceback|HTTP [45]/i.test(l)) d.className='err'; else if(/DONE|OK$|using the AI drawing/.test(l)) d.className='ok';
+   logEl.appendChild(d); lastLog=n;
+  }
+  if(j.lines.length) logEl.scrollTop=logEl.scrollHeight;
+ }catch(e){}
+ setTimeout(pollLogs,1000);
+}
+pollLogs();
 </script></body></html>"""
 
 
