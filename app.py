@@ -578,6 +578,14 @@ def build_prompt(style, simplify, idx, total):
     return p
 
 
+ASPECTS = {"16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "3:4": 3 / 4, "9:16": 9 / 16, "21:9": 21 / 9}
+
+
+def nearest_aspect(w, h):
+    r = w / h
+    return min(ASPECTS, key=lambda k: abs(ASPECTS[k] - r))
+
+
 def generate_part(job, i, total, video_url, image_urls, prompt, resolution, seconds, aspect):
     if "mini" in MODEL_ID and resolution not in ("480p", "720p"):
         resolution = "720p"                              # Mini tops out at 720p
