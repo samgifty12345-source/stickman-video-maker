@@ -11,19 +11,25 @@ You upload a video + a reference image of your main character. The bot:
 Run on Railway: see the Dockerfile + requirements.txt next to this file.
 
 Environment variables:
-  KREA_API_KEY      required. Krea API token (krea.ai -> API keys). API balance is separate from app credits.
-  APP_PASSWORD      optional. If set, people must type it.
-  PUBLIC_URL        optional. e.g. https://my-app.up.railway.app  (Krea must be able to download your files from it)
+  (no Krea key needed)  click "Login with Krea" on the page: videos are paid with your Krea app compute units.
+  KREA_API_KEY      optional fallback. Krea API token; uses the separate API balance when you are not logged in.
+  TOKEN_FILE        optional. Where the Krea login is saved. Use a Railway Volume (e.g. /data/krea_oauth.json) so it
+                    survives redeploys. Default is a temp file (you click Login again after each deploy).
+  APP_PASSWORD      optional but recommended: the connected Krea account is shared by everyone who opens the page.
+  PUBLIC_URL        optional. e.g. https://my-app.up.railway.app  (Krea downloads your clip + images from it)
   CHUNK_SECONDS     part length, default 15 (max 30)
   MAX_VIDEO_SECONDS longest upload allowed, default 120
-  SEEDANCE_ENDPOINT override the endpoint path if Krea changes it
+  SEEDANCE_ENDPOINT / SEEDANCE_MODEL  override the API path / MCP model id if Krea changes them
   PORT              set by Railway
 """
+import base64
+import hashlib
 import hmac
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -31,6 +37,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
@@ -41,6 +48,9 @@ from PIL import Image
 KREA = "https://api.krea.ai"
 KREA_KEY = os.environ.get("KREA_API_KEY", "")
 ENDPOINT = os.environ.get("SEEDANCE_ENDPOINT", "/generate/video/bytedance/seedance-2-5")
+MODEL_ID = os.environ.get("SEEDANCE_MODEL", "video/bytedance/seedance-2-5")
+MCP_URL = "https://api.krea.ai/mcp"
+TOKEN_FILE = os.environ.get("TOKEN_FILE", os.path.join(tempfile.gettempdir(), "krea_oauth.json"))
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 CHUNK = max(5, min(30, int(os.environ.get("CHUNK_SECONDS", "15"))))
 MAX_VIDEO = int(os.environ.get("MAX_VIDEO_SECONDS", "120"))
@@ -97,19 +107,325 @@ def make_chunk(src, dst, start, length, zone):
          "-an", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", dst])
 
 
-# ------------------------------------------------------------------ Krea API
-def krea_call(path, body=None, timeout=60):
-    req = urllib.request.Request(
-        KREA + path, data=json.dumps(body).encode() if body is not None else None,
-        method="POST" if body is not None else "GET",
-        headers={"Authorization": "Bearer " + KREA_KEY, "Content-Type": "application/json",
-                 "User-Agent": "remix-bot/1.0"})
+# ------------------------------------------------------------------ Krea access
+# Two ways in:  (1) "Login with Krea" (OAuth through Krea's MCP server) -> billed to your Krea app compute units
+#               (2) KREA_API_KEY -> billed to the separate API balance
+def http(url, data=None, headers=None, method=None, form=False, timeout=60):
+    body, h = None, {"User-Agent": "remix-bot/1.0", **(headers or {})}
+    if data is not None:
+        if form:
+            body = urllib.parse.urlencode(data).encode()
+            h["Content-Type"] = "application/x-www-form-urlencoded"
+        else:
+            body = json.dumps(data).encode()
+            h["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=h, method=method or ("POST" if body else "GET"))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, dict(r.headers), r.read().decode()
+
+
+def http_json(url, data=None, headers=None, form=False, timeout=60):
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+        return json.loads(http(url, data, headers, form=form, timeout=timeout)[2])
     except urllib.error.HTTPError as e:
         detail = re.sub(r"\s+", " ", e.read().decode(errors="ignore"))[:300]
-        raise RuntimeError(f"Krea HTTP {e.code}: {detail}")
+        raise RuntimeError(f"HTTP {e.code} from {urllib.parse.urlparse(url).netloc}: {detail}")
+
+
+AUTH = {"tokens": None, "clients": {}, "pending": {}, "meta": None}
+
+
+def _load_auth():
+    try:
+        with open(TOKEN_FILE) as fh:
+            d = json.load(fh)
+        AUTH["tokens"], AUTH["clients"] = d.get("tokens"), d.get("clients", {})
+    except (OSError, ValueError):
+        pass
+
+
+def _save_auth():
+    try:
+        with open(TOKEN_FILE, "w") as fh:
+            json.dump({"tokens": AUTH["tokens"], "clients": AUTH["clients"]}, fh)
+        os.chmod(TOKEN_FILE, 0o600)
+    except OSError as e:
+        log(f"[login] could not save the login to {TOKEN_FILE}: {e}")
+
+
+def discover():
+    """Find Krea's OAuth endpoints (standard MCP discovery)."""
+    if AUTH["meta"]:
+        return AUTH["meta"]
+    urls = []
+    try:
+        http(MCP_URL, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "remix-bot", "version": "1"}}},
+             {"Accept": "application/json, text/event-stream"})
+    except urllib.error.HTTPError as e:
+        m = re.search(r'resource_metadata="([^"]+)"', e.headers.get("WWW-Authenticate", ""))
+        if m:
+            urls.append(m.group(1))
+    except OSError:
+        pass
+    urls += ["https://api.krea.ai/.well-known/oauth-protected-resource/mcp",
+             "https://api.krea.ai/.well-known/oauth-protected-resource"]
+    issuer = None
+    for u in urls:
+        try:
+            issuer = json.loads(http(u)[2])["authorization_servers"][0]
+            break
+        except Exception:  # noqa
+            continue
+    issuer = (issuer or "https://api.krea.ai").rstrip("/")
+    for u in (issuer + "/.well-known/oauth-authorization-server", issuer + "/.well-known/openid-configuration"):
+        try:
+            meta = json.loads(http(u)[2])
+            if meta.get("authorization_endpoint") and meta.get("token_endpoint"):
+                AUTH["meta"] = meta
+                log(f"[login] found Krea login endpoints at {issuer}")
+                return meta
+        except Exception:  # noqa
+            continue
+    raise RuntimeError("Could not find Krea's login endpoints. Check the Live log and tell me what it says.")
+
+
+def oauth_start(base):
+    meta, redirect = discover(), base + "/oauth/callback"
+    cid = AUTH["clients"].get(redirect)
+    if not cid:
+        if not meta.get("registration_endpoint"):
+            raise RuntimeError("Krea does not allow apps to register automatically.")
+        reg = http_json(meta["registration_endpoint"], {
+            "client_name": "Video Remix Bot", "redirect_uris": [redirect], "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"], "token_endpoint_auth_method": "none"})
+        cid = reg["client_id"]
+        AUTH["clients"][redirect] = cid
+        _save_auth()
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    AUTH["pending"] = {k: v for k, v in AUTH["pending"].items() if time.time() - v["t"] < 900}
+    AUTH["pending"][state] = dict(verifier=verifier, redirect=redirect, cid=cid, t=time.time())
+    q = {"response_type": "code", "client_id": cid, "redirect_uri": redirect, "code_challenge": challenge,
+         "code_challenge_method": "S256", "state": state, "resource": MCP_URL}
+    if meta.get("scopes_supported"):
+        q["scope"] = " ".join(meta["scopes_supported"])
+    return meta["authorization_endpoint"] + "?" + urllib.parse.urlencode(q)
+
+
+def _store_tokens(tok, cid):
+    old = AUTH["tokens"] or {}
+    AUTH["tokens"] = dict(access_token=tok["access_token"], refresh_token=tok.get("refresh_token") or old.get("refresh_token"),
+                          expires_at=time.time() + int(tok.get("expires_in") or 3000) - 60, client_id=cid)
+    _save_auth()
+
+
+def oauth_finish(code, state):
+    p = AUTH["pending"].pop(state, None)
+    if not p:
+        raise RuntimeError("Login expired or was not started here. Click Login with Krea again.")
+    tok = http_json(discover()["token_endpoint"], {
+        "grant_type": "authorization_code", "code": code, "redirect_uri": p["redirect"], "client_id": p["cid"],
+        "code_verifier": p["verifier"], "resource": MCP_URL}, form=True)
+    _store_tokens(tok, p["cid"])
+    log("[login] connected to Krea: video costs now use your Krea compute units")
+
+
+def get_token():
+    t = AUTH["tokens"]
+    if not t:
+        return None
+    if time.time() < t.get("expires_at", 0):
+        return t["access_token"]
+    if t.get("refresh_token"):
+        try:
+            tok = http_json(discover()["token_endpoint"], {"grant_type": "refresh_token", "refresh_token": t["refresh_token"],
+                                                           "client_id": t["client_id"], "resource": MCP_URL}, form=True)
+            _store_tokens(tok, t["client_id"])
+            return AUTH["tokens"]["access_token"]
+        except RuntimeError as e:
+            log(f"[login] refresh failed: {e}")
+    AUTH["tokens"] = None
+    _save_auth()
+    return None
+
+
+def find_key(o, keys):
+    if isinstance(o, dict):
+        for k in keys:
+            if o.get(k) not in (None, "", [], {}):
+                return o[k]
+        for v in o.values():
+            r = find_key(v, keys)
+            if r is not None:
+                return r
+    elif isinstance(o, list):
+        for v in o:
+            r = find_key(v, keys)
+            if r is not None:
+                return r
+    return None
+
+
+def find_video_url(o):
+    urls = find_key(o, ("urls",))
+    if isinstance(urls, list) and urls and isinstance(urls[0], str):
+        return urls[0]
+    u = find_key(o, ("video_url", "url"))
+    return u if isinstance(u, str) and u.startswith("http") else None
+
+
+class Mcp:
+    """Tiny MCP client (Streamable HTTP) for Krea's server, using the logged-in account."""
+
+    def __init__(self):
+        self.sid, self.n, self.tools = None, 0, None
+        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                "clientInfo": {"name": "remix-bot", "version": "1"}})
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def _post(self, payload):
+        tok = get_token()
+        if not tok:
+            raise RuntimeError("Not logged in to Krea. Click Login with Krea.")
+        h = {"Authorization": "Bearer " + tok, "Accept": "application/json, text/event-stream",
+             "MCP-Protocol-Version": "2025-06-18"}
+        if self.sid:
+            h["Mcp-Session-Id"] = self.sid
+        try:
+            _, hdrs, body = http(MCP_URL, payload, h, timeout=90)
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Krea HTTP {e.code}: {re.sub(chr(10), ' ', e.read().decode(errors='ignore'))[:250]}")
+        sid = {k.lower(): v for k, v in hdrs.items()}.get("mcp-session-id")
+        if sid:
+            self.sid = sid
+        return body.strip()
+
+    def rpc(self, method, params=None):
+        self.n += 1
+        body = self._post({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params or {}})
+        msgs = ([json.loads(body)] if body.startswith("{") else
+                [json.loads(l[5:].strip()) for l in body.splitlines() if l.startswith("data:") and l[5:].strip().startswith("{")])
+        m = next((x for x in msgs if x.get("id") == self.n), msgs[-1] if msgs else None)
+        if not m:
+            raise RuntimeError(f"Empty reply from Krea for {method}")
+        if "error" in m:
+            raise RuntimeError(f"Krea error: {str(m['error'])[:250]}")
+        return m.get("result", {})
+
+    def call(self, tool, args):
+        res = self.rpc("tools/call", {"name": tool, "arguments": args})
+        data = res.get("structuredContent")
+        if data is None:
+            txt = "".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
+            try:
+                data = json.loads(txt)
+            except ValueError:
+                data = {"text": txt}
+        if res.get("isError"):
+            raise RuntimeError(f"Krea tool error: {str(data)[:300]}")
+        return data
+
+    def tool(self, name):
+        if self.tools is None:
+            self.tools = {t["name"]: t for t in self.rpc("tools/list").get("tools", [])}
+        if name not in self.tools:
+            raise RuntimeError(f"Krea MCP has no '{name}' tool (has: {', '.join(self.tools)})")
+        return self.tools[name]
+
+
+def oauth_generate(job, i, total, body):
+    m = Mcp()
+    gen = m.tool("generate")
+    props = (gen.get("inputSchema") or {}).get("properties", {})
+    if i == 1:
+        log(f"[remix] Krea 'generate' tool takes: {', '.join(props)}")
+    mk = next((k for k in ("model", "model_id", "modelId") if k in props), "model")
+    nest = next((k for k in ("params", "parameters", "input", "inputs", "body", "arguments") if k in props), None)
+
+    def args(preflight=False):
+        a = {mk: MODEL_ID}
+        if nest:
+            a[nest] = dict(body)
+        else:
+            a.update(body)
+        if preflight:
+            a["preflight"] = True
+        return a
+
+    if i == 1:                                   # price check before spending anything
+        try:
+            q = m.call("generate", args(True))
+            cu, have = find_key(q, ("compute_units",)), find_key(q, ("available_compute_units",))
+            log(f"[remix] cost quote: about {cu} compute units per part, you have {have}")
+            if find_key(q, ("affordable",)) is False:
+                raise RuntimeError(f"Not enough Krea compute units: one part costs about {cu} and you have {have}.")
+        except RuntimeError as e:
+            if "Not enough" in str(e):
+                raise
+            log(f"[remix] cost quote skipped: {e}")
+    data = m.call("generate", args())
+    url = find_video_url(data)
+    jid = find_key(data, ("job_id", "jobId", "id"))
+    if url and not jid:
+        return url
+    if not jid:
+        raise RuntimeError(f"Krea did not return a job id: {str(data)[:250]}")
+    log(f"[remix] part {i}/{total}: Krea job {jid} started")
+    jprops = (m.tool("get_job").get("inputSchema") or {}).get("properties", {})
+    jk = next((k for k in ("jobId", "job_id", "id") if k in jprops), "jobId")
+    t0, fails = time.time(), 0
+    while time.time() - t0 < 20 * 60:
+        time.sleep(4)
+        try:
+            j = m.call("get_job", {jk: jid})
+            fails = 0
+        except RuntimeError as e:
+            fails += 1
+            if fails > 4:
+                raise
+            if "HTTP 40" in str(e):
+                m = Mcp()
+            continue
+        st = str(find_key(j, ("status",)) or "").lower()
+        job["note"] = f"Part {i}/{total}: Seedance is working ({st or 'waiting'}, {int(time.time() - t0)}s)"
+        if st == "completed":
+            u = find_video_url(j)
+            if not u:
+                raise RuntimeError(f"Krea finished but I found no video URL: {str(j)[:250]}")
+            log(f"[remix] part {i}/{total}: done in {int(time.time() - t0)}s")
+            return u
+        if st in ("failed", "cancelled"):
+            raise RuntimeError(f"Krea job {st}: {str(find_key(j, ('error', 'message')) or j)[:250]}")
+    raise RuntimeError("Krea took longer than 20 minutes for one part.")
+
+
+def krea_call(path, body=None, timeout=60):
+    return http_json(KREA + path, body, {"Authorization": "Bearer " + KREA_KEY}, timeout=timeout)
+
+
+def api_generate(job, i, total, body):
+    sub = krea_call(ENDPOINT, body)
+    jid = sub.get("job_id")
+    if not jid:
+        raise RuntimeError(f"Krea did not return a job id: {str(sub)[:200]}")
+    log(f"[remix] part {i}/{total}: Krea API job {jid} started")
+    t0 = time.time()
+    while time.time() - t0 < 20 * 60:
+        time.sleep(4)
+        j = krea_call(f"/jobs/{jid}")
+        st = str(j.get("status", "")).lower()
+        job["note"] = f"Part {i}/{total}: Seedance is working ({st}, {int(time.time() - t0)}s)"
+        if st == "completed":
+            urls = (j.get("result") or {}).get("urls") or []
+            if not urls:
+                raise RuntimeError("Krea finished but gave no video URL.")
+            log(f"[remix] part {i}/{total}: done in {int(time.time() - t0)}s")
+            return urls[0]
+        if st in ("failed", "cancelled"):
+            raise RuntimeError(f"Krea job {st}: {str(j.get('error') or j)[:250]}")
+    raise RuntimeError("Krea took longer than 20 minutes for one part.")
 
 
 def build_prompt(style, simplify, idx, total):
@@ -132,26 +448,9 @@ def build_prompt(style, simplify, idx, total):
 def generate_part(job, i, total, video_url, image_urls, prompt, resolution):
     body = {"prompt": prompt, "reference_videos": [video_url], "reference_images": image_urls,
             "resolution": resolution, "generate_audio": False}
-    sub = krea_call(ENDPOINT, body)
-    jid = sub.get("job_id")
-    if not jid:
-        raise RuntimeError(f"Krea did not return a job id: {str(sub)[:200]}")
-    log(f"[remix] part {i}/{total}: Krea job {jid} started")
-    t0 = time.time()
-    while time.time() - t0 < 20 * 60:
-        time.sleep(4)
-        j = krea_call(f"/jobs/{jid}")
-        st = str(j.get("status", "")).lower()
-        job["note"] = f"Part {i}/{total}: Seedance is working ({st}, {int(time.time() - t0)}s)"
-        if st == "completed":
-            urls = (j.get("result") or {}).get("urls") or []
-            if not urls:
-                raise RuntimeError("Krea finished but gave no video URL.")
-            log(f"[remix] part {i}/{total}: done in {int(time.time() - t0)}s")
-            return urls[0]
-        if st in ("failed", "cancelled"):
-            raise RuntimeError(f"Krea job {st}: {str(j.get('error') or j)[:250]}")
-    raise RuntimeError("Krea took longer than 20 minutes for one part.")
+    if AUTH["tokens"]:
+        return oauth_generate(job, i, total, body)
+    return api_generate(job, i, total, body)
 
 
 def download(url, dst):
@@ -240,8 +539,8 @@ def public_base():
 def start():
     if PASSWORD and not hmac.compare_digest(request.form.get("password", ""), PASSWORD):
         return jsonify(error="Wrong password."), 403
-    if not KREA_KEY:
-        return jsonify(error="KREA_API_KEY is not set in Railway Variables."), 400
+    if not (AUTH["tokens"] or KREA_KEY):
+        return jsonify(error="Click \"Login with Krea\" first."), 400
     cleanup()
     if sum(1 for j in JOBS.values() if j["status"] in ("queued", "working")) >= 2:
         return jsonify(error="Busy with another video, try again in a few minutes."), 429
@@ -308,6 +607,44 @@ def result(jid):
     return send_file(p, mimetype="video/mp4", conditional=True)
 
 
+@app.post("/login")
+def login():
+    if PASSWORD and not hmac.compare_digest(request.form.get("password", ""), PASSWORD):
+        return jsonify(error="Type the password first."), 403
+    try:
+        return jsonify(url=oauth_start(public_base()))
+    except Exception as e:  # noqa
+        log(f"[login] FAILED: {e}")
+        return jsonify(error=str(e)), 500
+
+
+@app.get("/oauth/callback")
+def oauth_callback():
+    if request.args.get("error"):
+        return ("", 302, {"Location": "/?autherror=" + urllib.parse.quote(request.args.get("error_description") or request.args["error"])})
+    try:
+        oauth_finish(request.args.get("code", ""), request.args.get("state", ""))
+        return ("", 302, {"Location": "/?connected=1"})
+    except Exception as e:  # noqa
+        log(f"[login] FAILED: {e}")
+        return ("", 302, {"Location": "/?autherror=" + urllib.parse.quote(str(e)[:200])})
+
+
+@app.post("/logout")
+def logout():
+    if PASSWORD and not hmac.compare_digest(request.form.get("password", ""), PASSWORD):
+        return jsonify(error="Type the password first."), 403
+    AUTH["tokens"] = None
+    _save_auth()
+    log("[login] disconnected from Krea")
+    return jsonify(ok=True)
+
+
+@app.get("/auth/status")
+def auth_status():
+    return jsonify(connected=bool(AUTH["tokens"]), api_key=bool(KREA_KEY))
+
+
 @app.get("/logs")
 def logs():
     since = request.args.get("since", 0, type=int)
@@ -318,7 +655,7 @@ def logs():
 
 @app.get("/health")
 def health():
-    return f"ok | Krea key: {'set' if KREA_KEY else 'MISSING'}"
+    return f"ok | Krea login: {'connected' if AUTH['tokens'] else 'not connected'} | API key: {'set' if KREA_KEY else 'none'}"
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -333,9 +670,11 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  button{margin-top:18px;width:100%;padding:14px;border:0;border-radius:10px;background:#ff5a4d;color:#fff;font-size:1.1rem;font-weight:700} button:disabled{opacity:.5}
  .bar{height:10px;background:#252b48;border-radius:5px;margin-top:16px;overflow:hidden;display:none} .bar div{height:100%;width:0;background:#4ad98a}
  #msg{margin-top:10px;color:#cdd} video{width:100%;margin-top:14px;border-radius:10px;background:#000} a.dl{display:inline-block;margin-top:10px;color:#8fd3ff}
- small{color:#889}
+ small{color:#889} #conn{background:#181d33;border:1px solid #334;border-radius:10px;padding:10px 12px;margin:10px 0;display:flex;gap:10px;align-items:center;justify-content:space-between}
+ #conn button{margin:0;width:auto;padding:8px 14px;font-size:.9rem;background:#3b6cff}
 </style></head><body><div id="wrap"><div id="main">
 <h1>Video Remix Bot</h1>
+<div id="conn"><span>Krea: <b id="cs">checking...</b></span><button type="button" id="cb">Login with Krea</button></div>
 <form id="f">
  <label>1. Your video (4 to __MAXV__ seconds)</label><input type="file" name="video" accept="video/*" required>
  <label>2. Reference image(s) of your main character</label><input type="file" name="images" accept="image/*" multiple required>
@@ -373,6 +712,22 @@ async function poll(id){
   fill.style.width=Math.max(3,Math.round(j.progress*100))+'%'; setTimeout(()=>poll(id),2500);
  }catch(err){msg.textContent='Lost connection to the job. Try again.'; go.disabled=false;}
 }
+const cs=document.getElementById('cs'),cb=document.getElementById('cb'); let isConn=false;
+async function conn(){
+ try{const j=await (await fetch('/auth/status')).json(); isConn=j.connected;
+  cs.textContent=j.connected?'connected (videos use your Krea compute units)':(j.api_key?'not logged in (using API balance)':'not connected');
+  cs.style.color=j.connected?'#7be0a0':'#ffd479'; cb.textContent=j.connected?'Disconnect':'Login with Krea';}catch(e){}
+}
+cb.onclick=async()=>{
+ const fd=new FormData(); const pw=f.querySelector('[name=password]'); if(pw) fd.append('password',pw.value);
+ const r=await fetch(isConn?'/logout':'/login',{method:'POST',body:fd}); const j=await r.json();
+ if(!r.ok){msg.textContent=j.error||'Could not start the login.'; return;}
+ if(j.url) location.href=j.url; else conn();
+};
+const qs=new URLSearchParams(location.search);
+if(qs.get('autherror')) msg.textContent='Krea login failed: '+qs.get('autherror');
+if(qs.get('connected')) msg.textContent='Connected to Krea!';
+conn();
 let last=0; const L=document.getElementById('log');
 async function logs(){
  try{const r=await fetch('/logs?since='+last); const j=await r.json(); if(j.lines.length&&last===0) L.innerHTML='';
@@ -390,6 +745,8 @@ def index():
     pw = '<label>Password</label><input type="password" name="password" required>' if PASSWORD else ""
     return PAGE.replace("__PW__", pw).replace("__MAXV__", str(MAX_VIDEO))
 
+
+_load_auth()
 
 if __name__ == "__main__":
     if not shutil.which("ffmpeg"):
