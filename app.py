@@ -27,7 +27,7 @@ Environment variables:
   PUBLIC_URL        optional. e.g. https://my-app.up.railway.app  (Krea downloads your clip + images from it)
   CHUNK_SECONDS     part length, default 15 (max 15, Krea limit)
   MAX_VIDEO_SECONDS longest upload allowed, default 120
-  SEEDANCE_MODEL    default model shown on the page (default bytedance/seedance-2-fast).
+  SEEDANCE_MODEL    default model shown on the page (default bytedance/seedance-2-mini, the cheapest).
   SEEDANCE_ENDPOINT optional. Override the REST API path (only used with KREA_API_KEY).
   SEEDANCE_TOOL     optional. Force the exact Krea MCP tool name used to make the video (e.g. generate_video).
   LIBRARY_DIR       optional. Where finished videos are kept. On Railway add a Volume mounted at /data and they
@@ -62,7 +62,7 @@ from PIL import Image
 KREA = "https://api.krea.ai"
 KREA_KEY = os.environ.get("KREA_API_KEY", "")
 ENDPOINT = os.environ.get("SEEDANCE_ENDPOINT", "").strip()                # blank = built from the chosen model
-MODEL_ID = os.environ.get("SEEDANCE_MODEL", "bytedance/seedance-2-fast").strip()
+MODEL_ID = os.environ.get("SEEDANCE_MODEL", "bytedance/seedance-2-mini").strip()
 MODELS = [("bytedance/seedance-2-mini", "Mini (cheapest, stays closest to the original)"),
           ("bytedance/seedance-2-fast", "Fast (restyles much better)"),
           ("bytedance/seedance-2", "Full (best restyle, most expensive)")]
