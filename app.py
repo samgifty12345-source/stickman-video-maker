@@ -1,11 +1,20 @@
 """
-Video Remix Bot - one file.
+Video Remix Bot - one file (v2: stronger restyle prompt, moderation retry, model picker).
 
 You upload a video + a reference image of your main character. The bot:
   1. cuts the video into short parts (Seedance 2 makes 4-15s per clip),
   2. sends each part to Seedance 2 on Krea as a *video edit* (same motion and story, your character as the
      main character, new side characters made in its style, changed colors and backgrounds, captions removed),
   3. joins the new parts and lays the ORIGINAL sound/voice back on top.
+
+What is new in v2:
+  - The prompt now says "completely redraw in the reference image's style" FIRST (v1 said "keep everything").
+  - Every prompt is printed in the Live log, so you can see exactly what is sent.
+  - If Krea's moderation rejects a part, it retries with a softer prompt (3 tries). If it still fails, that part is
+    kept as the original clip so the whole video still finishes (you don't lose the other parts).
+  - Other temporary errors are retried too.
+  - Model picker on the page: Mini (cheapest), Fast, Full. Mini stays closest to the original, so Fast/Full
+    restyle much more.
 
 Run on Railway: see the Dockerfile + requirements.txt next to this file.
 
@@ -18,7 +27,8 @@ Environment variables:
   PUBLIC_URL        optional. e.g. https://my-app.up.railway.app  (Krea downloads your clip + images from it)
   CHUNK_SECONDS     part length, default 15 (max 15, Krea limit)
   MAX_VIDEO_SECONDS longest upload allowed, default 120
-  SEEDANCE_ENDPOINT / SEEDANCE_MODEL  override the API path / MCP model id if Krea changes them
+  SEEDANCE_MODEL    default model shown on the page (default bytedance/seedance-2-fast).
+  SEEDANCE_ENDPOINT optional. Override the REST API path (only used with KREA_API_KEY).
   SEEDANCE_TOOL     optional. Force the exact Krea MCP tool name used to make the video (e.g. generate_video).
   LIBRARY_DIR       optional. Where finished videos are kept. On Railway add a Volume mounted at /data and they
                     survive redeploys (default: /data/library if /data exists, else a temp folder).
@@ -51,8 +61,13 @@ from PIL import Image
 
 KREA = "https://api.krea.ai"
 KREA_KEY = os.environ.get("KREA_API_KEY", "")
-ENDPOINT = os.environ.get("SEEDANCE_ENDPOINT", "/generate/video/bytedance/seedance-2")
-MODEL_ID = os.environ.get("SEEDANCE_MODEL", "bytedance/seedance-2-mini")   # cheapest. Others: bytedance/seedance-2-fast, bytedance/seedance-2
+ENDPOINT = os.environ.get("SEEDANCE_ENDPOINT", "").strip()                # blank = built from the chosen model
+MODEL_ID = os.environ.get("SEEDANCE_MODEL", "bytedance/seedance-2-fast").strip()
+MODELS = [("bytedance/seedance-2-mini", "Mini (cheapest, stays closest to the original)"),
+          ("bytedance/seedance-2-fast", "Fast (restyles much better)"),
+          ("bytedance/seedance-2", "Full (best restyle, most expensive)")]
+if MODEL_ID not in [m for m, _ in MODELS]:
+    MODELS.append((MODEL_ID, MODEL_ID))
 FORCED_TOOL = os.environ.get("SEEDANCE_TOOL", "").strip()
 MCP_URL = "https://api.krea.ai/mcp"
 TOKEN_FILE = os.environ.get("TOKEN_FILE", os.path.join(tempfile.gettempdir(), "krea_oauth.json"))
@@ -381,37 +396,36 @@ class Mcp:
                            + ". Set SEEDANCE_TOOL to the right name.")
 
 
-_MODEL_CACHE = {}
+_MODEL_CACHE = {}            # wanted model id -> the id Krea's MCP really accepts
 
 
-def resolve_model(m):
+def resolve_model(m, wanted):
     """Ask Krea's MCP which Seedance model id it really accepts (ids differ from the REST API)."""
-    if "id" in _MODEL_CACHE:
-        return _MODEL_CACHE["id"]
-    chosen = MODEL_ID
-    if True:
-        try:
-            lp = (m.tool("list_models").get("inputSchema") or {}).get("properties", {})
-            raw = None
-            for a in ({"category": "video"}, {"type": "video"}, {}):
-                a = {k: v for k, v in a.items() if k in lp}
-                try:
-                    raw = m.call("list_models", a)
-                    break
-                except RuntimeError:
-                    continue
-            txt = json.dumps(raw) if raw is not None else ""
-            found = sorted(set(re.findall(r"[A-Za-z0-9_./\-]*seedance[A-Za-z0-9_./\-]*", txt, re.I)))
-            log(f"[remix] Krea Seedance models: {', '.join(found) or 'none found'}")
-            if not found:
-                log(f"[remix] list_models said: {txt[:1200]}")
-            else:
-                full = [f for f in found if "/" in f] or found
-                good = [f for f in full if not re.search(r"fast|mini|lite|pro-fast", f, re.I)]
-                pick = [f for f in good if re.search(r"seedance-?2", f, re.I)] or good or full
-                chosen = MODEL_ID if MODEL_ID in found else pick[0]
-        except Exception as e:  # noqa
-            log(f"[remix] could not list models: {e}")
+    if wanted in _MODEL_CACHE:
+        return _MODEL_CACHE[wanted]
+    chosen = wanted
+    try:
+        lp = (m.tool("list_models").get("inputSchema") or {}).get("properties", {})
+        raw = None
+        for a in ({"category": "video"}, {"type": "video"}, {}):
+            a = {k: v for k, v in a.items() if k in lp}
+            try:
+                raw = m.call("list_models", a)
+                break
+            except RuntimeError:
+                continue
+        txt = json.dumps(raw) if raw is not None else ""
+        found = sorted(set(re.findall(r"[A-Za-z0-9_./\-]*seedance[A-Za-z0-9_./\-]*", txt, re.I)))
+        log(f"[remix] Krea Seedance models: {', '.join(found) or 'none found'}")
+        if not found:
+            log(f"[remix] list_models said: {txt[:1200]}")
+        elif wanted not in found:
+            full = [f for f in found if "/" in f] or found
+            close = [f for f in full if f.lower().endswith(wanted.split("/")[-1].lower())]
+            chosen = close[0] if close else full[0]
+            log(f"[remix] model '{wanted}' not in Krea's list, using '{chosen}' instead")
+    except Exception as e:  # noqa
+        log(f"[remix] could not list models: {e}")
     log(f"[remix] using model id '{chosen}'")
     try:
         sp = (m.tool("get_model_schema").get("inputSchema") or {}).get("properties", {})
@@ -421,7 +435,7 @@ def resolve_model(m):
             log(f"[remix] model schema: {json.dumps(sch)[:1500]}")
     except Exception as e:  # noqa
         log(f"[remix] schema lookup skipped: {e}")
-    _MODEL_CACHE["id"] = chosen
+    _MODEL_CACHE[wanted] = chosen
     return chosen
 
 
@@ -439,16 +453,15 @@ def get_bal(m, show_raw=False):
         return None
 
 
-def oauth_generate(job, i, total, body):
+def oauth_generate(job, i, total, body, model):
     m = Mcp()
     gname = m.pick_generate_tool()
-    model_id = resolve_model(m)
+    model_id = resolve_model(m, model)
     gen = m.tool(gname)
     props = (gen.get("inputSchema") or {}).get("properties", {})
     if i == 1:
         log(f"[remix] using Krea tool '{gname}'")
         log(f"[remix] it takes: {', '.join(props) or '(no schema given)'}")
-        log(f"[remix] all Krea tools: {', '.join(m.tool_map())}")
     mk = next((k for k in ("model", "model_id", "modelId") if k in props), None)
     nest = next((k for k in ("params", "parameters", "input", "inputs", "body", "arguments") if k in props), None)
 
@@ -533,8 +546,8 @@ def krea_call(path, body=None, timeout=60):
     return http_json(KREA + path, body, {"Authorization": "Bearer " + KREA_KEY}, timeout=timeout)
 
 
-def api_generate(job, i, total, body):
-    sub = krea_call(ENDPOINT, body)
+def api_generate(job, i, total, body, model):
+    sub = krea_call(ENDPOINT or "/generate/video/" + model, body)
     jid = sub.get("job_id")
     if not jid:
         raise RuntimeError(f"Krea did not return a job id: {str(sub)[:200]}")
@@ -556,26 +569,32 @@ def api_generate(job, i, total, body):
     raise RuntimeError("Krea took longer than 20 minutes for one part.")
 
 
-def build_prompt(style, simplify, idx, total):
-    p = ("Edit the reference video: keep exactly the same story, actions, camera movement, framing, pacing and "
-         "timing as the reference video. The reference image(s) show the MAIN character: replace the video's "
-         "main character with that character, keeping its design, outfit and art style, and keep the main "
-         "character looking the same in every shot. ")
+def build_prompt(style, simplify, idx, total, soft=False):
+    """Restyle-first prompt. The reference video is used ONLY for motion/timing/camera."""
+    p = ("COMPLETELY REDRAW the reference video in a brand-new look. Use the reference video ONLY for the "
+         "timing, the movement and the camera path. Do NOT keep its art style, its colors, its characters or "
+         "its backgrounds. Redraw every single frame in the exact art style of the reference image: thick black "
+         "outlines, flat cartoon shading, simple clean shapes, smooth round peach-colored head. "
+         "The MAIN character is the man in the reference image (big round head, black tuxedo, white shirt, bow "
+         "tie). Replace the video's main character with him in every shot, keeping his design exactly the same. ")
     if simplify:
-        p += ("Create every other character in the video as a NEW, different character made for this story, "
-              "designed in the same art style and design language as the main character (same level of detail, "
-              "proportions and line work). Each one gets its own distinct face, outfit and look that fits their "
-              "role in the story. Do not copy the main character's face onto them. ")
+        p += ("Every other character must be a NEW, different character made for this story, drawn in the same "
+              "cartoon style as the main character, each with its own face, outfit and colors that fit their "
+              "role. Never copy the main character's face onto them. ")
     else:
-        p += "Keep the other characters as they are in the reference video. "
-    p += ("Change the color palette and redesign the backgrounds so the scene looks clearly different from the "
-          "reference video, while the layout and action stay readable. ")
+        p += "Keep the other characters' roles from the reference video, but redraw them in the same cartoon style. "
+    p += ("Use a totally different color palette and redesign every background and prop from scratch, so the "
+          "result looks like a different video made by a different artist. Nothing from the original look "
+          "should remain. ")
     if style:
         p += f"Style notes: {style}. "
-    p += "Remove all captions, subtitles, on-screen text, watermarks and logos, and do not add any text."
+    p += "Remove all captions, subtitles, on-screen text, watermarks and logos, and do not add any text. "
+    if soft:
+        p += ("Family-friendly children's cartoon: no violence, no blood, no weapons, no gore, no real people "
+              "or realistic faces, everything is a simple drawn cartoon. ")
     if total > 1:
-        p += f" This is part {idx} of {total} of one continuous video; keep the same characters and look in every part."
-    return p
+        p += f"This is part {idx} of {total} of one continuous video; keep the same characters and look in every part."
+    return p.strip()
 
 
 ASPECTS = {"16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "3:4": 3 / 4, "9:16": 9 / 16, "21:9": 21 / 9}
@@ -586,14 +605,41 @@ def nearest_aspect(w, h):
     return min(ASPECTS, key=lambda k: abs(ASPECTS[k] - r))
 
 
-def generate_part(job, i, total, video_url, image_urls, prompt, resolution, seconds, aspect):
-    if "mini" in MODEL_ID and resolution not in ("480p", "720p"):
-        resolution = "720p"                              # Mini tops out at 720p
+def generate_part(job, i, total, video_url, image_urls, prompt, resolution, seconds, aspect, model):
+    if ("mini" in model or "fast" in model) and resolution == "1080p":
+        resolution = "720p"                              # Mini and Fast top out at 720p
     body = {"prompt": prompt, "reference_videos": [video_url], "reference_images": image_urls[:9],
             "resolution": resolution, "duration": int(max(4, min(15, round(seconds)))), "aspect_ratio": aspect}
     if AUTH["tokens"]:
-        return oauth_generate(job, i, total, body)
-    return api_generate(job, i, total, body)
+        return oauth_generate(job, i, total, body, model)
+    return api_generate(job, i, total, body, model)
+
+
+def generate_with_retry(job, jid, base, i, n_run, image_urls, opts, length, aspect):
+    """3 tries per part. Moderation rejection -> softer prompt. Still rejected -> return None (keep original)."""
+    soft = False
+    for attempt in range(1, 4):
+        prompt = build_prompt(opts["style"], opts["simplify"], i, n_run, soft)
+        log(f"[remix] part {i}/{n_run} PROMPT (try {attempt}, model {opts['model']}): {prompt}")
+        try:
+            return generate_part(job, i, n_run, f"{base}/files/{jid}/chunk_{i}.mp4", image_urls, prompt,
+                                 opts["resolution"], length, aspect, opts["model"])
+        except RuntimeError as e:
+            msg = str(e)
+            if "Not enough" in msg or "Not logged in" in msg:
+                raise
+            policy = "content_policy" in msg or "moderation" in msg.lower()
+            if attempt == 3:
+                if policy:
+                    return None
+                raise
+            if policy:
+                soft = True
+                log(f"[remix] part {i}/{n_run} was rejected by moderation (try {attempt}/3). Retrying with a softer prompt...")
+            else:
+                log(f"[remix] part {i}/{n_run} error (try {attempt}/3): {msg[:200]}. Retrying...")
+                time.sleep(8)
+    return None
 
 
 def download(url, dst):
@@ -679,32 +725,32 @@ def worker(jid, base, opts):
             dur = duration(src)
             n = max(1, math.ceil(dur / CHUNK))
             length = dur / n
-            if opts["test_first"]:
-                n_run = 1
-            else:
-                n_run = n
+            n_run = 1 if opts["test_first"] else n
             job["all_parts"] = n
-            log(f"[remix {jid}] {dur:.1f}s video -> {n} part(s) of {length:.1f}s, running {n_run}")
+            log(f"[remix {jid}] {dur:.1f}s video -> {n} part(s) of {length:.1f}s, running {n_run}, model {opts['model']}")
             image_urls = [f"{base}/files/{jid}/{f}" for f in sorted(os.listdir(wd)) if f.startswith("ref_")]
-            outs = []
+            outs, kept_original = [], []
             for i in range(n_run):
                 job["progress"] = i / n_run
                 job["note"] = f"Part {i + 1}/{n_run}: preparing the clip..."
                 chunk = os.path.join(wd, f"chunk_{i + 1}.mp4")
                 make_chunk(src, chunk, i * length, length)
                 cw, ch = dims(chunk)
-                url = generate_part(job, i + 1, n_run, f"{base}/files/{jid}/chunk_{i + 1}.mp4", image_urls,
-                                    build_prompt(opts["style"], opts["simplify"], i + 1, n_run), opts["resolution"],
-                                    length, nearest_aspect(cw, ch))
-                out = os.path.join(wd, f"out_{i + 1}.mp4")
-                download(url, out)
+                url = generate_with_retry(job, jid, base, i + 1, n_run, image_urls, opts, length, nearest_aspect(cw, ch))
+                if url:
+                    out = os.path.join(wd, f"out_{i + 1}.mp4")
+                    download(url, out)
+                else:
+                    log(f"[remix {jid}] part {i + 1} was rejected 3 times by moderation: KEEPING THE ORIGINAL CLIP for this part")
+                    kept_original.append(i + 1)
+                    out = chunk
                 outs.append((chunk, out))
             job["note"], job["progress"] = "Joining the parts and adding the original sound...", 0.95
             w, h = dims(outs[0][0])
             fixed = []
-            for k, (_, out) in enumerate(outs, 1):          # same size/fps so the parts join cleanly
+            for k, (orig, out) in enumerate(outs, 1):       # same size/fps so the parts join cleanly
                 fx = os.path.join(wd, f"fix_{k}.mp4")
-                want, got = duration(_), duration(out)       # Krea only makes whole seconds: stretch to match
+                want, got = duration(orig), duration(out)    # Krea only makes whole seconds: stretch to match
                 ratio = want / got if got > 0 else 1.0
                 run(["ffmpeg", "-y", "-loglevel", "error", "-i", out, "-an", "-vf",
                      f"setpts={ratio:.5f}*PTS,scale={w}:{h},fps=30,format=yuv420p", "-t", f"{want:.3f}",
@@ -726,7 +772,8 @@ def worker(jid, base, opts):
             secs = duration(final)
             meta = dict(id=jid, created=time.time(), title=opts["title"] or "Remix", description=opts["description"],
                         tags=opts["tags"], visibility=opts["vis"], test=bool(opts["test_first"]), seconds=secs,
-                        parts=n_run, model=_MODEL_CACHE.get("id", MODEL_ID), youtube=None)
+                        parts=n_run, model=_MODEL_CACHE.get(opts["model"], opts["model"]), youtube=None,
+                        kept_original=kept_original)
             lib_save(meta)
             log(f"[remix {jid}] saved to the library ({secs:.0f}s, {fw}x{fh_})")
             if opts["post_youtube"]:
@@ -745,7 +792,10 @@ def worker(jid, base, opts):
                         meta["youtube"] = {"error": str(e)[:300]}
                         log(f"[youtube] FAILED: {str(e)[:400]}")
                     lib_save(meta)
-            job.update(status="done", progress=1.0, note="Done! Saved under Saved videos below.")
+            note = "Done! Saved under Saved videos below."
+            if kept_original:
+                note += f" (Part(s) {', '.join(map(str, kept_original))} were blocked by Krea's filter and kept as the original.)"
+            job.update(status="done", progress=1.0, note=note)
             log(f"[remix {jid}] DONE")
     except Exception as e:  # noqa
         log(f"[remix {jid}] FAILED: {str(e)[:900]}")
@@ -822,9 +872,11 @@ def start():
     except Exception as e:  # noqa
         shutil.rmtree(wd, ignore_errors=True)
         return jsonify(error=f"Could not read your files: {str(e)[:200]}"), 400
+    allowed_models = [m for m, _ in MODELS]
     opts = dict(style=(request.form.get("style") or "").strip()[:400],
                 simplify=request.form.get("simplify") == "on",
                 resolution=request.form.get("resolution") if request.form.get("resolution") in ("480p", "720p", "1080p") else "720p",
+                model=request.form.get("model") if request.form.get("model") in allowed_models else MODEL_ID,
                 test_first=request.form.get("test_first") == "on",
                 title=(request.form.get("title") or "").strip()[:100],
                 description=(request.form.get("description") or "").strip()[:2000],
@@ -1037,11 +1089,12 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <label>1. Your video (4 to __MAXV__ seconds)</label><input type="file" name="video" accept="video/*" required>
  <label>2. Reference image(s) of your main character</label><input type="file" name="images" accept="image/*" multiple required>
  <small>One clear picture is enough. More angles = more consistent character.</small>
- <label>3. What should change? (colors, backgrounds, style)</label>
- <textarea name="style" rows="3" maxlength="400" placeholder="e.g. neon purple and orange colors, new backgrounds: futuristic city and desert, flat cartoon look"></textarea>
+ <label>3. What should the NEW look be? (colors, backgrounds, style) - the more specific, the bigger the change</label>
+ <textarea name="style" rows="3" maxlength="400" placeholder="e.g. warm gold and deep teal colors, new ancient-city backgrounds, flat cartoon look, thick black outlines"></textarea>
  <div class="chk"><input type="checkbox" name="simplify" id="sm" checked><label for="sm" style="margin:0">Create new other characters in the main character's style (not copies of its face)</label></div>
  <div class="row">
-  <div><label>Quality</label><select name="resolution"><option value="480p">480p (cheapest)</option><option value="720p" selected>720p</option><option value="1080p">1080p (most expensive)</option></select></div>
+  <div><label>Model</label><select name="model">__MODELOPTS__</select></div>
+  <div><label>Quality</label><select name="resolution"><option value="480p">480p (cheapest)</option><option value="720p" selected>720p</option><option value="1080p">1080p (Full model only)</option></select></div>
  </div>
  <div class="chk"><input type="checkbox" name="test_first" id="tf" checked><label for="tf" style="margin:0">Test run: only remix the first part (saves money while you check the look)</label></div>
  <label>YouTube title</label><input name="title" maxlength="100" placeholder="Title for the Short">
@@ -1097,7 +1150,7 @@ let last=0; const L=document.getElementById('log');
 async function logs(){
  try{const r=await fetch('/logs?since='+last); const j=await r.json(); if(j.lines.length&&last===0) L.innerHTML='';
   for(const [n,l] of j.lines){const d=document.createElement('div'); d.textContent=l;
-   if(/error|failed|traceback|HTTP [45]/i.test(l)) d.className='err'; else if(/DONE|done in/.test(l)) d.className='ok'; L.appendChild(d); last=n;}
+   if(/error|failed|traceback|HTTP [45]|rejected/i.test(l)) d.className='err'; else if(/DONE|done in/.test(l)) d.className='ok'; L.appendChild(d); last=n;}
   if(j.lines.length) L.scrollTop=L.scrollHeight;}catch(e){}
  setTimeout(logs,1500);
 }
@@ -1119,6 +1172,7 @@ async function lib(){
    const v=document.createElement('video'); v.src='/library/'+it.id+'.mp4'; v.controls=true; v.playsInline=true; v.preload='metadata'; d.appendChild(v);
    const t=document.createElement('div'); t.style.cssText='margin-top:6px;font-size:.9rem';
    t.textContent=(it.test?'[test] ':'')+it.title+' - '+Math.round(it.seconds)+'s - '+new Date(it.created*1000).toLocaleString(); d.appendChild(t);
+   if(it.kept_original&&it.kept_original.length){const w=document.createElement('div'); w.style.cssText='font-size:.8rem;margin-top:4px;color:#ffd479'; w.textContent='Part(s) '+it.kept_original.join(', ')+' were blocked by Krea and kept as the original.'; d.appendChild(w);}
    const yt=document.createElement('div'); yt.style.cssText='font-size:.85rem;margin-top:4px';
    if(it.youtube&&it.youtube.url){const a=document.createElement('a'); a.href=it.youtube.url; a.target='_blank'; a.textContent='Posted on YouTube'; a.className='dl'; a.style.margin='0'; yt.appendChild(a);}
    else if(it.youtube&&it.youtube.error){yt.textContent='YouTube post failed: '+it.youtube.error; yt.style.color='#ff8a8a';}
@@ -1145,7 +1199,8 @@ if(savedJob){go.disabled=true; bar.style.display='block'; msg.textContent='Recon
 @app.get("/")
 def index():
     pw = '<label>Password</label><input type="password" name="password" required>' if PASSWORD else ""
-    return PAGE.replace("__PW__", pw).replace("__MAXV__", str(MAX_VIDEO))
+    opts = "".join(f'<option value="{m}"{" selected" if m == MODEL_ID else ""}>{label}</option>' for m, label in MODELS)
+    return PAGE.replace("__PW__", pw).replace("__MAXV__", str(MAX_VIDEO)).replace("__MODELOPTS__", opts)
 
 
 _load_auth()
